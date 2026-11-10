@@ -13,11 +13,9 @@ Dofile 生成模块
   3. 两条路径共享同一份网表事实（netlist_facts），不依赖 golden。
 """
 
-import copy
 import json
 import os
 import re
-import sys
 import time
 
 try:
@@ -33,13 +31,7 @@ except ImportError:
 INPUT_MOUNT = os.environ.get("INPUT_MOUNT", "/input")
 
 # 候选 dofile 生成数量（LLM 可用时）
-#
-# 【2026-10-28 从 2 降到 1】评分维度包含 **token 消耗**。两个候选 = 两轮完整的
-# 「理解 + 计划」调用，token 直接翻倍，而收益很小：R22 起生成路径改为
-# 「LLM 出 JSON 决策 → 规则渲染」，决策空间被白名单与端口校验收窄，
-# 两次采样的差异主要体现在写法而非正确性（public 用例实测两个候选语义等价）。
-# 保留候选机制（set_candidate_count / 择优记录仍可用），只是默认不重复采样。
-CANDIDATE_COUNT = int(os.environ.get("CANDIDATE_COUNT", "1"))
+CANDIDATE_COUNT = int(os.environ.get("CANDIDATE_COUNT", "2"))
 
 
 def set_candidate_count(n):
@@ -93,22 +85,10 @@ COMMAND_WHITELIST = {
         "[-respect_sff_se_connection true|false] "
         "[-insert_terminal_lockup true|false] [-si_port_format \"...\"] [-so_port_format \"...\"]"
     ),
-    # 选项集来自手册「配置 DFT Partition」示例（p15/p16）：
-    #   add_scan_partition p1 -include core1/subA
-    #   add_scan_partition p2 -include { core1/subB core1/subC } -exclude { core1/subB/u1 }
-    #   add_scan_partition p3 -clocks clk1 -rising_edge_clocks clk2
-    # 旧条目只写了 -include/-clocks，LLM 照抄示例写 -exclude / -rising_edge_clocks 时
-    # 会被判成「参数不合法」。
-    "add_scan_partition": (
-        "add_scan_partition <name> [-include {inst...}] [-exclude {inst...}] "
-        "[-clocks {clk...}] [-rising_edge_clocks {clk...}]  定义扫描分区"),
+    "add_scan_partition": "add_scan_partition <name> [-include {inst...}] [-clocks {clk...}]  定义扫描分区",
     "set_current_scan_partition": "set_current_scan_partition <name>  切换当前扫描分区",
     "set_dft_clock_gating_cfg": "set_dft_clock_gating_cfg -exclude_elements {<inst_or_module...>}  排除模块/实例的 ICG 重连（作用范围含 Hierarchy Cell 及 Leaf Cell）",
-    # 手册 2.1.2.x：`set_scan_element true {dff1 dff2}` / `set_scan_element false {...}`，
-    # 参数是**花括号列表**，作用范围含 Hierarchy Cell，多 bit 寄存器可用 `inst:bitX`。
-    "set_scan_element": (
-        "set_scan_element true|false {<inst_or_module...>}  标记可/不可扫描元素"
-        "（支持 inst:bitX 指定位）"),
+    "set_scan_element": "set_scan_element false \"<path>\"  标记不可扫描元素",
     "set_scan_drc_rule_handling": "set_scan_drc_rule_handling {DFTR-TIE1 DFTR-TIE0} Ignore  调整 DRC 违例等级（手册 2.1.3.3）",
     "set_scan_drc_cfg": "set_scan_drc_cfg -clock_gating_init_cycles <N>  配置 DRC 检查参数（官方 golden 写法，如 task_2/case3）",
     "set_wrapper_cfg": "set_wrapper_cfg [enable] [-style shared|dedicated|none] [-chain_count N] [-max_length N] [-mix_cell true|false] [-reuse_threshold N] [-depth_threshold N] [-mix_internal_clocks true|false] [-shared_cell_type <cell>] [-dedicated_cell_type none|WC_D1|user_defined] [-input_shift_enable <p>] [-output_shift_enable <p>] [-input_capture_enable <p>] [-output_capture_enable <p>] [-port <p>]  （不带 -port 的是全局配置；-reuse_threshold/-depth_threshold/-max_length/-mix_cell/-mix_internal_clocks 只在全局配置生效）",
@@ -154,7 +134,7 @@ COMMAND_WHITELIST = {
     "add_inst": "add_inst <inst> <cell_type>  新建一个实例（cell 必须在该 Liberty 库里）",
     "delete_inst": "delete_inst <inst>  删除实例",
     "connect_pin": "connect_pin -from <src> -to <pin>  把已有 net/端口连到 pin",
-    "add_port": "add_port {<name> ...} -direction in|out|inout  新建端口",
+    "add_port": "add_port <name> -direction input|output  新建端口",
     "delete_port": "delete_port <name>  删除端口",
     "connect_pg_net": "connect_pg_net -net <pg_net> -pin <pin>  连接电源/地网络",
     "get_obj_nets": "get_obj_nets <obj>  查询对象关联的 net（诊断用）",
@@ -165,17 +145,6 @@ COMMAND_WHITELIST = {
 }
 
 # 明确禁止的幻觉命令（LLM 容易编造的通用 EDA 命令名，映射到正确命令）
-# 手册 PDF 解析出的「伪命令」：都是真命令被截断/把选项当命令的结果。
-# 官方问答（2026-11-01）：hidden case 不会出现手册外的命令 —— 所以这里可以收紧。
-# 放在 known_commands 里会让这类拼写错误**静默通过**校验，工具再报 CMD-0074，
-# 白烧一轮工具调用；剔除并给出正确名，则可以在补丁落地时直接纠正。
-_MANUAL_PARSE_NOISE = {
-    "set_scan_signa": "set_scan_signal",              # 表格列宽截断，少一个 l
-    "set_current_partition": "set_current_scan_partition",
-    "set_scan_skew_grp": "set_scan_skew_group",
-    "add_lockup": "",        # 实为 set_scan_cfg 的选项，不是命令；无正确名可替换
-}
-
 _HALLUCINATED_COMMANDS = {
     "read_lib": "load_lib",
     "read_netlist": "load_netlist",
@@ -203,10 +172,7 @@ _HALLUCINATED_COMMANDS = {
     "set_scan_configuration": "set_scan_cfg",
     "scan_configuration": "set_scan_cfg",
     "set_dft_config": "set_scan_cfg",
-    # 注意：**不要**把 set_scan_chain 放进来。手册里它是真命令
-    # （示例：`set_scan_chain my_chain1 -scan_enable SCAN_EN -scan_data_in SI1 …`），
-    # 之前误列在这里，会让"用 set_scan_chain 手工指定链"的正确写法被判成幻觉命令、
-    # 整份 dofile 被丢弃、回退到根本不会用这条命令的规则模板。
+    "set_scan_chain": "set_scan_cfg",
     "compile": "insert_dft_logic",
     "insert_scan": "insert_dft_logic",
     "set_scan_architecture": "set_scan_cfg",
@@ -336,83 +302,10 @@ def iter_tcl_statements(text):
     return stmts
 
 
-
-# ---------------------------------------------------------------------------
-# 手册反推的「合法命令集」—— 校验器的真正依据
-# ---------------------------------------------------------------------------
-# 背景（2026-10-27 核查）：COMMAND_WHITELIST 是人工维护的**常用**命令表
-# （39 条，全部有手册依据，没有一条是编的），但手册里还有一批真命令不在表里：
-#   add_scan_chain / remove_scan_chain / set_scan_chain / get_scan_chain_cell /
-#   set_scan_chain_retiming / define_dft_ip / define_dft_ip_group /
-#   set_current_dft_ip_group / rpt_dft_ip_group / add_dedicated_cell_for_nonscan /
-#   add_dedicated_cells_module / add_test_retiming_flops / insert_terminal_lockup /
-#   remove_scan_signal / remove_wrapper_cfg / rpt_pseudo_pi / read_file …
-# 旧实现把「不在白名单」直接判成幻觉命令 → 新 case 一旦真的要 add_scan_chain，
-# LLM 写对了也会被丢掉、回退规则模板，而这些命令规则模板根本不会用。
-#
-# 所以：**校验依据改成手册**（镜像里就有），白名单只作为「常用集」出现在 prompt 里。
-_COMMAND_VERBS = {
-    "add", "set", "get", "load", "dump", "rpt", "report", "examine", "insert",
-    "delete", "connect", "disconnect", "define", "present", "trim", "write",
-    "read", "check", "remove", "expand", "update", "create", "rewire", "replace",
-    "import", "export", "swap", "fix", "opt", "run",
-}
-
-_MANUAL_COMMANDS = None
-
-
-def manual_command_names():
-    """从镜像内的手册（md/ 目录 + PDF 索引）反推合法命令名（幂等，结果缓存）。"""
-    global _MANUAL_COMMANDS
-    if _MANUAL_COMMANDS is not None:
-        return _MANUAL_COMMANDS
-
-    names = set()
-    try:                                    # 1) md/ 文件名即命令名
-        md_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              "manual", "md")
-        for fname in os.listdir(md_dir):
-            if fname.endswith(".md"):
-                names.add(fname[:-3])
-    except OSError:
-        pass
-
-    try:                                    # 2) PDF 索引里出现的「动词_名词」token
-        import manual_rag
-        idx = manual_rag.get_rag().index
-        text = "\n".join((c.get("text") or "") for c in idx.get("chunks") or [])
-        # 直接用「全文出现过的 verb_noun」作为候选，再按动词前缀过滤。
-        # 为什么不用「命令位」精确匹配：手册里大量命令只出现在中文叙述中
-        # （「用户可通过 set_scan_chain 命令…」「…及 set_scan_segment 命令」），
-        # 精确匹配会漏掉一批真命令，而**漏掉 = 校验时判成幻觉 = 丢掉正确的 dofile**。
-        # 代价是可能多认一两个不存在的名字，那远好于错杀真命令。
-        names |= set(re.findall(r"(?<![a-z_])([a-z][a-z0-9]*_[a-z0-9_]+)\b", text))
-    except Exception:                       # noqa: BLE001  手册缺失时退回白名单
-        pass
-
-    # 只保留「动词_名词」形态，滤掉选项名与取值（scan_chain / scan_data_in …）
-    names = {n for n in names if n.split("_")[0] in _COMMAND_VERBS}
-    names -= set(_HALLUCINATED_COMMANDS)     # 已知不存在的命令永不放行
-    _MANUAL_COMMANDS = names
-    return names
-
-
-def known_commands():
-    """校验器认可的合法命令集：白名单 ∪ 手册反推集 ∪ Tcl 控制关键字。
-
-    手册反推集里混着 PDF 表格截断造成的伪命令（见 _MANUAL_PARSE_NOISE），
-    它们不是真命令，必须剔掉 —— 否则拼写错误会被当成合法命令放行。
-    """
-    return ((set(COMMAND_WHITELIST) | manual_command_names())
-            - set(_MANUAL_PARSE_NOISE))
-
-
 def validate_dofile_commands(dofile_text):
     """
-    校验 dofile 里的命令名是否**是真实命令**，返回违规列表。
-
-    判据是「白名单 ∪ 手册反推集」——不是只认白名单。手册里有、白名单没有的
-    真命令（add_scan_chain / define_dft_ip …）必须放行，否则新 case 写对了也会被丢。
+    校验 dofile 中的命令名是否都在白名单内，返回违规命令列表。
+    用于过滤 LLM 生成的幻觉命令。
 
     按 **Tcl 顶层语句** 校验（见 iter_tcl_statements）：跨行的反斜杠续行、
     大括号块、方括号块都不会被误判成独立命令。
@@ -427,7 +320,7 @@ def validate_dofile_commands(dofile_text):
         if not m:
             continue
         cmd = m.group(1)
-        if cmd in _TCL_CONTROL_KEYWORDS or cmd in known_commands():
+        if cmd in COMMAND_WHITELIST or cmd in _TCL_CONTROL_KEYWORDS:
             continue
         # 是 [file ...] 之类的子命令调用（以 [ 开头），跳过
         if stripped.startswith("["):
@@ -711,36 +604,7 @@ def fix_scan_signal_usage(dofile_text):
 _ENUM_ARG_VALUES = {
     "-dedicated_cell_type": frozenset({"none", "WC_D1", "user_defined"}),
     "-internal_clocks": frozenset({"none", "single", "multi"}),
-    # -style 漏在表外，代价是一整轮工具调用（2026-10-30 测试13 实测）：
-    # LLM 计划把 wrapper_cfg.style 填成 null，渲染出 `set_wrapper_cfg enable -style None`，
-    # 工具直接报 `[ERROR] CMD-0074 The value 'None' for argument '-style' is not valid`。
-    # 之后那一轮「针对性修复」又把 None 改成了合法值 none —— 语义从「shared」变成
-    # 「不做 wrapper」，比报错更糟。删掉这个选项走工具默认值才是安全解。
-    "-style": frozenset({"none", "shared", "dedicated"}),
 }
-
-
-_WRAPPER_STYLES = ("none", "shared", "dedicated")
-
-
-def _wrapper_style(v):
-    """
-    把 wrapper style 收敛到工具认的三个值（none / shared / dedicated）。
-
-    LLM 计划里常见 null / "None" / 大小写混乱。直接插值会写出 `-style None`，
-    工具报 `CMD-0074 The value 'None' ... is not valid` 并中断整份 dofile
-    （2026-10-30 测试13 t1/case6 实测：Run1 直接 ERROR，Run2 被"修复"成
-    `-style none` —— 语义从 shared 变成不做 wrapper，比报错更糟）。
-    """
-    if v is None:
-        return "shared"
-    s = str(v).strip()
-    # 合法值只有**小写** none。`None` / `NONE` / `null` 都是模型把"没想好"写出来的，
-    # 语义是"用默认值"，不能当成"不要 wrapper"—— 那是完全相反的行为。
-    if s == "none":
-        return "none"
-    s = s.lower()
-    return s if s in ("shared", "dedicated") else "shared"
 
 
 def _tcl_brace_delta(text):
@@ -947,55 +811,17 @@ def tcl_quote(s):
     return f'"{s}"'
 
 
-
-def collapse_duplicated_mount(dofile_text, mount=None):
-    """
-    收敛重复的挂载前缀：`/input/input/lib/x` → `/input/lib/x`（幂等）。
-
-    为什么要有这道全局兜底：错误路径可能来自三个地方 —— 结构化抽取把任务书里的
-    `input/lib/xxx` 原样带过来、LLM 自己写错、或某个拼接函数少剥一段。
-    逐个修源头容易漏，写盘前统一收敛一次最省事。
-    错误路径的代价极高：工具报 COM-3301 + CMD-3038，后面几十条命令连锁失败，
-    整轮直接白跑（case5 实测 69 条 ERROR）。
-    """
-    if not dofile_text:
-        return dofile_text
-    root = (mount or INPUT_MOUNT).replace("\\", "/").rstrip("/")
-    doubled = root + root + "/"
-    while doubled in dofile_text:
-        dofile_text = dofile_text.replace(doubled, root + "/")
-    return dofile_text
-
-
 def abs_input_path(task, rel_path):
     """
     根据输入文件的相对路径（如 lib/sky130.lib 或 netlist/xxx.v）生成绝对路径。
-
-    【2026-10-27 修】原来直接 os.path.join(base, rel)—— 当 rel 自带 `input/`
-    前缀时（任务书里常写成 `input/lib/xxx.lib`，结构化抽取会原样带过来），
-    结果就是 `/input/input/lib/xxx.lib`。这个路径不存在，工具报
-    COM-3301 + CMD-3038 → 后面 69 条连锁 ERROR，整轮白跑。
-
-    现在与 `_input_join` 用同一套规则：剥掉 `input` / `.` / `..` 段再拼；
-    已是绝对路径时也做一次挂载前缀收敛（`/input/input/x` → `/input/x`）。
+    优先用 task['input_dir'] 拼接，回退到 INPUT_MOUNT。
     """
-    rel_path = (rel_path or "").replace("\\", "/").strip()
-    base = (task.get("input_dir") or INPUT_MOUNT).replace("\\", "/").rstrip("/")
-    if not rel_path:
-        return base
-
+    rel_path = rel_path.replace("\\", "/")
+    base = task.get("input_dir", INPUT_MOUNT)
+    # 若 rel_path 已是绝对路径则直接返回
     if os.path.isabs(rel_path):
-        return _collapse_mount_prefix(rel_path, base)
-
-    parts = [p for p in rel_path.split("/") if p not in ("", ".", "..", "input")]
-    return base + "/" + "/".join(parts) if parts else base
-
-
-def _collapse_mount_prefix(path, base):
-    """把 `/input/input/lib/x` 收敛成 `/input/lib/x`（幂等）。"""
-    while path.startswith(base + "/" + base.lstrip("/") + "/"):
-        path = base + "/" + path[len(base) + len(base.lstrip("/")) + 2:]
-    return path
+        return rel_path
+    return os.path.join(base, rel_path).replace("\\", "/")
 
 
 # ============================================================================
@@ -1173,36 +999,15 @@ def _ref_dofiles(task):
 # 只有明确要求时才把网表事实里的移位链展开成 set_scan_segment —— 否则会凭空
 # 给不需要 segment 的 case 加命令。
 _SEG_REQUIRE_RE = re.compile(
-    r"(?:移位寄存器|移位链|shift\s*reg(?:ister)?|shift\s*chain)[^\n]{0,80}?"
-    r"(?:scan\s*segment|扫描段|segment)"
-    r"|(?:scan\s*segment|扫描段|segment)[^\n]{0,80}?"
-    r"(?:移位寄存器|移位链|shift\s*reg(?:ister)?|shift\s*chain)"
-    # 不点名 segment 但语义等价的写法（新 case 常见）：
-    # 「移位寄存器须整体作为一个单元，不得被拆分」
-    r"|(?:移位寄存器|移位链|shift\s*reg(?:ister)?|shift\s*chain)[^\n]{0,40}?"
-    r"(?:不得拆分|不可拆分|保持完整|整体处理|不拆开|按原结构保留)",
+    r"(?:移位寄存器|shift\s*reg(?:ister)?)[^\n]{0,80}?scan\s*segment"
+    r"|scan\s*segment[^\n]{0,80}?(?:移位寄存器|shift\s*reg)",
     re.I,
 )
 
-_SEG_WEAK_RE = re.compile(r"segment|扫描段|移位寄存器|shift\s*register", re.I)
 
-
-def wants_scan_segments(task, understanding=None):
-    """
-    是否要求把移位寄存器配置成 scan segment。
-
-    ★ 2026-11-01 改造：判据从「题面必须出现 segment 字样」放宽为
-      「规则句式命中」**或**「LLM 明确给了 segments 且题面确实谈到移位寄存器/段」。
-      理由：这个判断本质是读中文语义（题面可能写「移位链须保持完整」「整段处理」），
-      纯正则必然漏。LLM 已经在读同一份题面，让它参与判断，规则只做**闸门校验**
-      （题面完全不提移位寄存器时，一律不写 —— 防模型凭空编段，2026-10-30 t1/c2 教训）。
-    """
-    spec = (task or {}).get("task_spec", "") or ""
-    if _SEG_REQUIRE_RE.search(spec):
-        return True
-    if understanding and (understanding.get("scan_segments") or []):
-        return bool(_SEG_WEAK_RE.search(spec))
-    return False
+def wants_scan_segments(task):
+    """task_spec 是否明确要求把移位寄存器配置成 scan segment。"""
+    return bool(_SEG_REQUIRE_RE.search(task.get("task_spec", "") or ""))
 
 
 def ensure_facts(task, facts=None, deadline=None, want_chains=True):
@@ -1239,18 +1044,14 @@ def facts_derived_commands(task, facts):
         按该模块实际端口名与语义生成注册命令。
 
     Returns:
-        dict: {"segments": [str], "segment_count": int, "wrappers": [str]}
+        dict: {"segments": [str], "wrappers": [str]}
     """
-    out = {"segments": [], "segment_count": 0, "wrappers": []}
+    out = {"segments": [], "wrappers": []}
     if not facts or not facts.get("ok"):
         return out
     if wants_scan_segments(task):
-        lines, covered = netlist_facts.segment_commands(facts)
+        lines, _ = netlist_facts.segment_commands(facts)
         out["segments"] = lines
-        # 段**条数**必须单独记：`len(lines)` 是生成出来的行数（合并成 for 循环后
-        # 5 组 280 段只有 45 行），拿它写注释会说「共 45 条」（2026-11-01 第五轮
-        # 新 case 实测），与真实段数差 6 倍。
-        out["segment_count"] = int(covered or 0)
     out["wrappers"] = netlist_facts.wrapper_register_commands(facts)
     return out
 
@@ -1355,36 +1156,6 @@ _HARD_FULL_RE = re.compile(
 def workflow_evidence(spec):
     """返回 (是否显式不建链, 是否显式要求插链)，用于决策日志留痕。"""
     return bool(_HARD_PRE_RE.search(spec or "")), bool(_HARD_FULL_RE.search(spec or ""))
-
-
-# 三步前置处理在 dofile 里的标志（与 _PRE_STEPS 对应）。
-_PRE_STEP_FLAGS = ("-connect_icg_only", "-replace_only", "-replace_unscan")
-
-
-def dofile_builds_chain(dofile_text):
-    """从**已有 dofile** 判定它到底建不建扫描链。
-
-    返回 True / False；无法判定（根本没有 insert_dft_logic）时返回 None。
-
-    为什么不复用 decide_workflow：那条看任务书措辞，这条看已经写好的脚本。
-    修 dofile 的场景（补配置、补声明）手上只有文本，需要的是「这份脚本会不会建链」，
-    而不是「任务书想干什么」—— 两者不一致时，按脚本实际内容落笔才不会自相矛盾。
-
-    判据：出现**不带三步标志**的 insert_dft_logic 才是建链；只有
-    `-connect_icg_only / -replace_only / -replace_unscan` 的属于前置处理。
-
-    依据（11 份 public golden 全部吻合）：
-      · 前置处理型（task_1/case1、case4）：golden 里 **0 条** set_scan_signal -type clock，
-        且完全没有 set_scan_cfg；
-      · 建链型（其余 9 份）：都有时钟声明，且都带 set_scan_cfg。
-    """
-    hits = re.findall(r"(?m)^[ \t]*insert_dft_logic\b[^\n]*", dofile_text or "")
-    if not hits:
-        return None
-    for line in hits:
-        if not any(flag in line for flag in _PRE_STEP_FLAGS):
-            return True
-    return False
 
 
 def decide_workflow(task, understanding=None):
@@ -1536,23 +1307,6 @@ def drc_ignore_rules(task):
         for m in _DRC_RULE_ID_RE.finditer(head):
             if m.group(1) not in ids:
                 ids.append(m.group(1))
-
-    # 「除 A 与 B/C 外，DRC 违例为 0」—— 这是最常见的写法，和「忽略」是同一个意思。
-    #
-    # 2026-10-31 新 case 实测：t1/c2、t1/c4 都是这句，我们一条都不写，
-    # 验收项"DRC 清零"直接做不到（TIE 类违例本来就要靠这条声明豁免）。
-    #
-    # 只取 `除…外` 里的 **TIE / L 类**：这类违例手册允许 Ignore；
-    # 而同一句里常一起出现的 `DFTR10`（时钟被采样到数据端）是"允许残留"的
-    # 结构性违例，**不能**一起塞进 Ignore —— golden 也把它留在 Warning。
-    for line in spec.splitlines():
-        m = re.search(r"除([^。；\n]{0,120}?)外", line)
-        if not m:
-            continue
-        for mm in _DRC_RULE_ID_RE.finditer(m.group(1)):
-            rid = mm.group(1)
-            if re.match(r"(?i)^DFTR[-_]?(TIE[01]|L[12])$", rid) and rid not in ids:
-                ids.append(rid)
     return ids
 
 
@@ -1562,98 +1316,6 @@ def drc_rule_handling_line(rule_ids, level="Ignore"):
     if not valid:
         return None
     return "set_scan_drc_rule_handling {%s} %s" % (" ".join(valid), level)
-
-
-def repair_missing_assoc_for_drc(dofile_text, parsed, facts=None):
-    """
-    DRC 报 DFTR9（时钟在测试态不可活动）成片时，把 `-associated_internal_clocks` 补回去。
-
-    为什么单列一条（2026-10-31 测试14 的 t1/case5 实证）：
-      那份 dofile 少了 `-associated_internal_clocks {x_aq_mp_clk_top/apb_clk}`
-      （引用校验误判删掉了），工具直接报 **DFTR9 × 4215** —— 跟手册里
-      "缺这条声明时日志里 4,215 条 DFTDRC-4005" 的数字一模一样。
-      而当时的重试阶梯只认 DFTR1/DFTR2/3，于是三轮各 390s、共 1268s，
-      DRC 一条没降，最后三份产物全是坏的。
-
-    判据刻意收窄：**DFTR9 ≥ 50 条**（零星几条是别的原因）、说明书/网表事实里
-    确实有这个引脚、且 dofile 里一条 assoc 都没有。三者都满足才补，补在第一
-    条 `-type clock` 上（golden 就是挂在主时钟上）。
-    """
-    if not dofile_text:
-        return None
-    pin = str((facts or {}).get("associated_internal_clocks") or "").strip()
-    if not pin:
-        return None
-    if "-associated_internal_clocks" in dofile_text:
-        return None                      # 已有声明，不是这条路径的问题
-    rules = {str(k).upper(): v for k, v in ((parsed or {}).get("drc_rules") or {}).items()}
-    n = int(rules.get("DFTR9") or 0)
-    if n < 50:
-        return None
-    m = re.search(r"(?m)^[ \t]*(set_scan_signal\s+-type\s+clock\b[^\n]*)$", dofile_text)
-    if not m:
-        return None
-    src = m.group(1)
-    # `-off_state 0` 这类尾随选项要保留，把 assoc 插在它们之前
-    add = f" -associated_internal_clocks {{ {pin} }}"
-    if re.search(r"\s-off_state\b", src):
-        new_line = re.sub(r"(\s+-off_state\b)", add + r"\1", src, count=1)
-    else:
-        new_line = src + add
-    print(f"  ↳ DFTR9 共 {n} 条（内部时钟域未声明）：补 -associated_internal_clocks {{{pin}}}")
-    return dofile_text[:m.start(1)] + new_line + dofile_text[m.end(1):]
-
-
-def repair_missing_reset_for_drc(dofile_text, parsed, task, facts=None):
-    """
-    DRC 报「复位/置位不可控」（DFTR2/DFTR3）而 dofile 一条 reset 都没声明时，补齐。
-
-    为什么按 DRC 反馈补、而不是按任务书补（2026-10-30 新 case 复盘）：
-      一个完整插链任务里我们有 1810 条「复位不可控」，逐条查下来是**整份脚本
-      没有任何 set_scan_signal -type reset**。而按「任务书没点名就不写」的既有
-      纪律（t1/case4 的 golden 确实一条都不写），这条声明永远不会被补出来。
-
-      两条纪律并不冲突：**DRC 报告本身就是最硬的证据** —— 工具说复位不可控，
-      说明设计里真的有复位端口没有被约束。所以判据改成「工具报了 → 才补」，
-      报不出来就不补（不会误伤 case4 那类前置处理型）。
-
-    Returns:
-        新文本；无需/无法补时返回 None。
-    """
-    if not dofile_text:
-        return None
-    rules = {str(k).upper(): v for k, v in ((parsed or {}).get("drc_rules") or {}).items()}
-    n = int(rules.get("DFTR2") or 0) + int(rules.get("DFTR3") or 0)
-    if n < 1:
-        return None
-    if re.search(r"-type\s+reset\b", dofile_text):
-        return None                      # 已经声明过，交给别的修复路径
-
-    ports = list((facts or {}).get("top_ports") or {})
-    if not ports:
-        return None
-    declared = set(re.findall(r"-port\s+[\"']?([\w/\[\]$]+)", dofile_text))
-    cands = [p for p in ports
-             if p not in declared
-             and re.search(r"(^|_)(rst|reset|rstn|resetn)(_|$)", p, re.I)]
-    if not cands:
-        return None
-    cands = sorted(cands, key=len)[:4]
-
-    def _off(p):
-        """低有效命名（rst_n / reset_b / rstn / rst_ln）-> off_state 0，否则 1。"""
-        base = re.sub(r"\d+$", "", p)
-        return 0 if re.search(r"(?i)(rst|reset)[_]?[nbl]$|[_][nbl]$", base) else 1
-
-    lines = [f"set_scan_signal -type reset -port {p} -off_state {_off(p)}"
-             for p in cands]
-    print(f"  ↳ DFTR2/3 共 {n} 条（复位不可控）：补 {len(lines)} 条 reset 声明"
-          f"（{'、'.join(cands)}）")
-    block = "\n".join(lines)
-    m = re.search(r"(?m)^[ \t]*(examine_scan_drc|insert_dft_logic)\b", dofile_text)
-    if m:
-        return dofile_text[:m.start()] + block + "\n" + dofile_text[m.start():]
-    return dofile_text.rstrip("\n") + "\n" + block + "\n"
 
 
 def repair_internal_clocks_for_drc(dofile_text, parsed, attempt=1):
@@ -1826,35 +1488,12 @@ def sanitize_clock_ports(dofile_text, task):
                   if _functional_clock_near_port(spec, p)
                   and not _scan_clock_near_port(spec, p)}
 
-    # ── 例外：pseudo PI 的时钟声明必须保留 ──────────────────────────────
-    # 平台实测（task_1/case5，openC906）：
-    #   dofile 里有 9 条 add_pseudo_pi（utlb/pmp/clint/fspu/cp0/pcfifo/fdsu/dcache
-    #   这些 block 内部 ICG 的 clk_out），但**对应的 -type clock 声明被判非端口删光**，
-    #   结果这 9 个时钟域全部不可控 → insertion_info 里
-    #   `Nonscannable FF Count = 69022`，与 drc.rpt 的 `DFTR1×69022` 精确相等。
-    #   （三次调 internal_clocks 档位都一模一样，正是因为它跟这里无关。）
-    #
-    # 手册的固定搭配就是 add_pseudo_pi + 同路径 set_scan_signal -type clock：
-    # 伪主输入本来就是「内部路径」，天然不在顶层端口表里，不能按「非端口」删。
-    # 所以这里先收集所有 pseudo PI 路径，命中就跳过清洗。
-    pseudo_pis = set()
-    for blk in re.findall(r"add_pseudo_pi\s*\{([^}]*)\}", dofile_text, re.S):
-        for tok in blk.replace("\\", " ").split():
-            tok = tok.strip().strip('"')
-            if tok:
-                pseudo_pis.add(tok)
-    for p in (task or {}).get("pseudo_pi") or []:
-        pseudo_pis.add(str(p).strip())
-
     kept, dropped = [], []
     for line in dofile_text.splitlines(keepends=True):
         m = re.search(
             r"set_scan_signal\s+-type\s+clock\s+-port\s+(\S+)", line)
         if m:
             port = m.group(1).strip().strip('"')
-            if port in pseudo_pis:
-                kept.append(line)          # 伪主输入：内部路径，必须保留
-                continue
             if port not in ports and port not in base:
                 dropped.append(port)
                 continue
@@ -1879,28 +1518,12 @@ def ensure_scan_cfg_from_spec(task, dofile_text):
     于是 task_2/case2 分区级的 `-max_length 300` 被当成**全局**要求写进了全局
     set_scan_cfg（与参考 dofile 冲突）。现在统一委托给 spec_fixer，单一实现。
     """
-    # 分区模式下，链数/链长是**逐分区**配置：官方 golden（task_1/case2）的全局
-    # set_scan_cfg 只有 add_lockup / mix_edges / 端口格式，没有 chain_count/max_length。
-    # 这里若再补一份全局值，默认分区就会按它切链，与参考结果的链数分布不一致。
-    if re.search(r"(?m)^\s*add_scan_partition\b", dofile_text or ""):
-        # 分区模式下全局 set_scan_cfg 的链数/链长不动，但 **-internal_clocks 是
-        # 纯全局项**，题面明确写了就该校对（v5 t2_04：题面要 multi、original 写 single）。
-        try:
-            try:
-                from . import spec_fixer as _sf2
-            except ImportError:
-                import spec_fixer as _sf2                  # type: ignore
-            return _sf2.align_internal_clocks(task, dofile_text)
-        except Exception:                                       # noqa: BLE001
-            return dofile_text
     try:
         try:
             from . import spec_fixer as _sf
         except ImportError:
             import spec_fixer as _sf                      # type: ignore
-        # 先按规格校对链数/链长，再校正 -internal_clocks（后者只动那一个选项，
-        # 放最后避免被前者重建整条 set_scan_cfg 时覆盖掉）。
-        return _sf.align_internal_clocks(task, _sf.fix_scan_cfg(task, dofile_text))
+        return _sf.fix_scan_cfg(task, dofile_text)
     except Exception:                                           # noqa: BLE001
         return dofile_text
 
@@ -2025,31 +1648,7 @@ _ACTIVE_LOW_RE = re.compile(r"(_b|_n|_bar|_ni|_bn)$", re.I)
 # '最大链长 1000'，且中间可能夹着括号说明（如 case6 的「（含内部链与 wrapper 链）不超过」）。
 # 统一用一条正则，供理解抽取与 spec 校验共用（spec_verifier 内有一份等价拷贝）。
 _MAX_LEN_RE = re.compile(
-    r"(?:最大\s*链?\s*长(?:度)?|链\s*最大\s*长(?:度)?)[^\d\n]{0,40}?(\d{1,6})"
-    # 「`max_length` 不超过 **220**」——命令选项名直接出现在题面里，也是最常见的写法
-    r"|max_length[^\d\n]{0,24}?(\d{1,6})", re.I)
-
-
-_PARTITION_TABLE_RE = re.compile(r"\|\s*分区\s*\|[^\n]*chain_count", re.I)
-
-
-def partition_max_length(task):
-    """
-    分区表形态下**逐分区**的最大链长（说明书原文的「…最大长度统一为 N」）。
-
-    为什么不复用 u["scan_cfg"]["max_length"]：那条路是有意不写全局的（见
-    _scan_cfg_from_spec 的说明 —— 写进全局会把默认分区也卡住），而 LLM 计划又不保证
-    每次都带这个数。于是「有分区表 + 计划漏写」时 7 条 set_scan_cfg 会一起丢掉
-    -max_length，与 golden 差 6~7 处（t1/case2 实测：LLM 波动时好时坏）。
-    这里在**渲染分区命令行时**直接从说明书补，与 LLM 输出无关。
-
-    只在「有分区表」时生效；没有分区表就返回 None，交给原来的全局逻辑。
-    """
-    spec = (task or {}).get("task_spec", "") or ""
-    if not _PARTITION_TABLE_RE.search(spec):
-        return None
-    m = _MAX_LEN_RE.search(spec)
-    return int(m.group(1) or m.group(2)) if m else None
+    r"(?:最大\s*链?\s*长(?:度)?|链\s*最大\s*长(?:度)?)[^\d\n]{0,40}?(\d{1,6})")
 
 
 def _clock_from_tables(spec, u):
@@ -2071,83 +1670,7 @@ def _clock_from_tables(spec, u):
                 continue
             port = _first_ident(cells[col])
             if port and not any(c.get("port") == port for c in u["clock_signals"]):
-                _clk = {"port": port}
-                _off = _explicit_off_state(spec, port)
-                if _off is not None:
-                    _clk["off_state"] = _off
-                u["clock_signals"].append(_clk)
-
-
-def _explicit_off_state(text, port=""):
-    """
-    从任务书里找**显式给出**的关闭状态值；没写就返回 None（不生成 -off_state）。
-
-    2026-10-28 修正：此前规则只要识别出时钟端口就顺手补 `off_state: 0`，
-    但全 10 个 public case 的 task_spec **没有一处**写「关闭状态」；
-    golden 里 t1/case1、t1/case4、t1/case6 也完全不写 -off_state。
-    无据补全会让 dofile 与 golden 产生无意义的差异（t1/case6 实测），
-    且掩盖真正需要推导的字段。手册里 -off_state 本就是可选参数。
-
-    只认这几类明确表述（不做「默认 0」的猜测）：
-      off_state 0 / 关闭状态为 0 / 关闭状态 1 / 低电平有效(->1) / 高电平有效(->0)
-    """
-    if not text:
-        return None
-    near = text
-    if port:
-        # 只在提到该端口的那一行/那句附近找，避免把别处的值套到这个端口上
-        lines = [l for l in text.splitlines() if port in l]
-        near = "\n".join(lines) if lines else ""
-        if not near:
-            return None
-    m = re.search(r"off_?state\s*(?:为|是|=|:)?\s*([01])\b", near, re.I)
-    if m:
-        return int(m.group(1))
-    m = re.search(r"关闭状态\s*(?:为|是|=|:)?\s*([01])\b", near)
-    if m:
-        return int(m.group(1))
-    # 极性词必须**紧贴**该端口才认。
-    #
-    # 为什么不能整行找（2026-10-28 t1/case2 实测）：任务书第 152 行写
-    #     「`clk_i` 和 `bit_clk_pad_i` 为扫描时钟，`rst_i` 为低有效复位…」
-    # 「低有效」修饰的是 rst_i，但整行匹配会把 clk_i / bit_clk_pad_i 也判成
-    # 低有效 → 时钟被写成 -off_state 1（golden 是 0），方向反了。
-    # 改成「端口名之后 12 字符内」判定，就能只认出 `rst_i` 为低有效复位。
-    if port:
-        for pm in re.finditer(re.escape(port), near):
-            win = near[pm.end():pm.end() + 12]
-            if re.search(r"低电平有效|低有效|active[\s_-]*low", win, re.I):
-                return 1
-            if re.search(r"高电平有效|高有效|active[\s_-]*high", win, re.I):
-                return 0
-        return None
-    if re.search(r"低电平有效|低有效|active[\s_-]*low", near, re.I):
-        return 1
-    if re.search(r"高电平有效|高有效|active[\s_-]*high", near, re.I):
-        return 0
-    return None
-
-
-def _se_off_state_from_spec(spec):
-    """
-    题面「N 个 `scan_enable` 信号（off_state = X）」里的 X；有歧义时返回 None。
-
-    为什么不复用 `_explicit_off_state`：那个函数按**端口名**过滤行，而这类条目
-    写的是「1 个 `scan_enable` 信号（off_state = 0）」，**不含端口名**，过滤后
-    文本为空 → 永远返回 None。public/task_1/case3 的 off_state 就是这样丢的
-    （golden 是 `-off_state 0`，我们输出成 `-usage scan`）。
-
-    只在全篇取值**唯一**时返回：题面有多个使能、各自 off_state 不同时
-    （如 case1 的 scan_enable/icg_scan_en），一刀切会把某一类写错。
-    """
-    vals = set()
-    for line in (spec or "").splitlines():
-        if not re.search(r"scan_?enable|扫描使能", line, re.I):
-            continue
-        m = re.search(r"off_?state\s*(?:为|是|=|:)?\s*([01])\b", line, re.I)
-        if m:
-            vals.add(int(m.group(1)))
-    return next(iter(vals)) if len(vals) == 1 else None
+                u["clock_signals"].append({"port": port, "off_state": 0})
 
 
 def _scan_enable_from_tables(spec, u):
@@ -2249,92 +1772,7 @@ def _scan_cfg_from_ref(ref, u):
     u["scan_cfg"].update(cfg)
 
 
-def _reapply_explicit_switches(task, u):
-    """
-    参考 dofile 合并之后，把**任务书明写的**布尔开关再压回去（mix_clocks / mix_edges）。
-
-    为什么需要（2026-10-31）：`_scan_cfg_from_ref` 的定位是"参考实现最权威"，
-    但 task_2 的 original.dofile 是**被注入过缺陷**的，`-mix_clocks true`
-    可能正是那个错。题面写着「不混时钟域」时不压回去，就是拿错答案覆盖对答案。
-    """
-    spec = (task or {}).get("task_spec", "") or ""
-    cfg = (u or {}).get("scan_cfg")
-    if not spec or not isinstance(cfg, dict):
-        return
-    if re.search(r"不混(?:合)?(?:时钟)?域", spec) \
-            or re.search(r"(?:不允许|不得|禁止|不可)[^\n]{0,12}混合[^\n]{0,12}时钟域", spec) \
-            or re.search(r"不得跨时钟域|不可跨时钟域|不允许跨时钟域", spec):
-        cfg["mix_clocks"] = False
-    elif re.search(r"允许[^\n]{0,12}混合[^\n]{0,12}(?:同一条|同一)\s*scan\s*chain", spec, re.I):
-        cfg["mix_clocks"] = True
-    if re.search(r"不混[^\n]{0,6}沿|(?:不允许|不得|禁止|不可)[^\n]{0,12}沿混合", spec):
-        cfg["mix_edges"] = False
-    elif re.search(r"允许[^\n]{0,12}混[^\n]{0,6}沿", spec):
-        cfg["mix_edges"] = True
-    # 链数/链长同理：original.dofile 里的数字可能是被注入的错，
-    # 题面给了明确数字就以题面为准（2026-10-31：public/t2/c1 题面「共 4 条链」，
-    # 参考 dofile 写 2，我们照抄了 2）。
-    _plan = spec_chain_plan(spec) or {}
-    if _plan.get("total"):
-        cfg["chain_count"] = _plan["total"]
-    _ml = _MAX_LEN_RE.search(spec)
-    if _ml:
-        try:
-            cfg["max_length"] = int(_ml.group(1) or _ml.group(2))
-        except (TypeError, ValueError):
-            pass
-
-
-# 题面里数字常被 markdown 强调包住（`共 **4 条链**`），所有模式都要容忍 `*` / 反引号。
-_B = r"[*`\s]{0,3}"
-_CHAIN_TOTAL_RES = (
-    r"共" + _B + r"(\d+)" + _B + r"条" + _B + r"(?:扫描)?链",
-    r"链数" + _B + r"(?:为|是)?" + _B + r"(\d+)",
-    r"扫描链" + _B + r"[:：]?" + _B + r"[^\d\n]{0,12}?(\d+)" + _B + r"条",
-    r"构建[^\n]{0,12}?(\d+)" + _B + r"条" + _B + r"(?:扫描)?链",
-    r"(\d+)" + _B + r"条" + _B + r"扫描链",
-    r"(\d+)" + _B + r"条链",
-)
-
-
-def spec_chain_plan(spec):
-    """
-    从题面抽链数规划，返回 {"total": N} / {"domains": [n1, n2, ...]} / None。
-
-    为什么单列（2026-10-31 三套新 case）：
-      旧实现只认「扫描链…N 条」与「wrapper/unwrapper chain N 条」两种写法，
-      而题面实际这么写：
-        · 「配置扫描链：**8 条**，单时钟域」            -> total 8
-        · 「构建扫描链，共 **4 条链**」                  -> total 4
-        · 「三域分别为 27 / 3 / 2 条链」                 -> domains
-        · 「WB 域…配 34 条链（每链 ≤300）；TX / RX 各配 1 条链」 -> domains
-      结果是没有分区表的 case 一条都不写 `-chain_count`，工具自己按 max_length 切，
-      链数与验收项对不上（public/t1/case2 实测 3 条 vs 应有 13 条）。
-
-    优先级：显式总分 > 逐域列表 > None（不猜）。
-    """
-    if not spec:
-        return None
-    # 1) 「27 / 3 / 2 条链」这类并列写法
-    m = re.search(r"(\d+(?:\s*/\s*\d+){2,})" + _B + r"条" + _B + r"链", spec)
-    if m:
-        return {"domains": [int(x) for x in re.findall(r"\d+", m.group(1))]}
-    # 2) 「A 域 N 条…B 域 M 条…」：同一段里出现 >=2 组「域…N 条链」
-    pairs = re.findall(r"([\u4e00-\u9fa5A-Za-z_]{1,8})\s*域[^\n。；]{0,24}?(\d+)\s*条\s*链", spec)
-    if len(pairs) >= 2:
-        return {"domains": [int(n) for _, n in pairs]}
-    # 3) 显式总分
-    for pat in _CHAIN_TOTAL_RES:
-        m = re.search(pat, spec)
-        if m:
-            try:
-                return {"total": int(m.group(1))}
-            except (TypeError, ValueError):
-                continue
-    return None
-
-
-def _scan_cfg_from_spec(spec, u, facts=None):
+def _scan_cfg_from_spec(spec, u):
     """
     从 task_spec 正文抽取扫描链配置（hidden case 无 golden 时的唯一来源）。
 
@@ -2346,52 +1784,17 @@ def _scan_cfg_from_spec(spec, u, facts=None):
         return
     cfg = u["scan_cfg"]
 
-    # 分区表（| 分区 | chain_count |）= 逐分区配置，全局项一概不写。
-    has_partition_table = bool(re.search(r"\|\s*分区\s*\|[^\n]*chain_count", spec, re.I))
-
-    # 有分区表时「所有非默认分区的扫描链最大长度统一为 300」是**逐分区**的量，
-    # 写进全局会把默认分区也卡在 300（t1/case2 实测：全局多出 -max_length 300，
-    # 而 7 个分区一个都没写，与 golden 正好相反）。
-    if "max_length" not in cfg and not has_partition_table:
+    if "max_length" not in cfg:
         m = _MAX_LEN_RE.search(spec)
         if m:
-            cfg["max_length"] = int(m.group(1) or m.group(2))
+            cfg["max_length"] = int(m.group(1))
 
-    # 链数：任务书常写成「wrapper chain 15 条，unwrapper chain 55 条」，
-    # 参考实现（public/task_1/case3 golden）就是把两者相加写
-    # `set_scan_cfg -chain_count 70`，同时 `set_wrapper_cfg -chain_count 15`。
-    # 不给链数时工具按 max_length 自己切，链数会与参考结果不一致
-    # （t1/case2 实测 3 条 vs 应有 13 条）。
-    if "chain_count" not in cfg:
-        # 分区表是逐分区配置，不能折成全局链数（判据见函数头）
-        if not has_partition_table:
-            w = re.search(r"wrapper\s*chain[^\n]{0,16}?(\d+)\s*条", spec, re.I)
-            ucnt = re.search(r"unwrapper\s*chain[^\n]{0,16}?(\d+)\s*条", spec, re.I)
-            if w and ucnt:
-                cfg["chain_count"] = int(w.group(1)) + int(ucnt.group(1))
-            else:
-                _plan = spec_chain_plan(spec) or {}
-                if _plan.get("total"):
-                    cfg["chain_count"] = _plan["total"]
-                elif _plan.get("domains"):
-                    # 逐域列表且无分区表 -> 总和就是全局链数
-                    cfg["chain_count"] = sum(_plan["domains"])
-
-    # 混时钟域：**任务书原文优先于参考 dofile**。
-    # task_2 的 original.dofile 里常写着 `-mix_clocks true`（有时正是被注入的那个错），
-    # 只判「cfg 里没有才写」会让题面明写的「不混时钟域」失效（2026-10-31 t2/c1、t2/c2
-    # 两例：我们 true、golden false，方向正好相反）。
-    _mix_explicit = None
-    if re.search(r"(?:不允许|不得|禁止|不可)[^\n]{0,12}混合[^\n]{0,12}时钟域", spec) \
-            or re.search(r"不得跨时钟域|不可跨时钟域|不允许跨时钟域", spec) \
-            or re.search(r"不混(?:合)?(?:时钟)?域", spec):
-        # 「不混时钟域」是最短的那种写法（t2/c2 原文：「不混时钟域、不混触发沿」），
-        # 旧判据要求出现「不允许…混合…时钟域」全句，短句一律漏。
-        _mix_explicit = False
-    elif re.search(r"允许[^\n]{0,12}混合[^\n]{0,12}(?:同一条|同一)\s*scan\s*chain", spec, re.I):
-        _mix_explicit = True
-    if _mix_explicit is not None:
-        cfg["mix_clocks"] = _mix_explicit
+    if "mix_clocks" not in cfg:
+        if re.search(r"(?:不允许|不得|禁止|不可)[^\n]{0,12}混合[^\n]{0,12}时钟域", spec) \
+                or re.search(r"不得跨时钟域|不可跨时钟域|不允许跨时钟域", spec):
+            cfg["mix_clocks"] = False
+        elif re.search(r"允许[^\n]{0,12}混合[^\n]{0,12}(?:同一条|同一)\s*scan\s*chain", spec, re.I):
+            cfg["mix_clocks"] = True
 
     if "mix_edges" not in cfg:
         if re.search(r"(?:不允许|不得|禁止|不可)[^\n]{0,12}(?:时钟)?沿混合|不混[^\n]{0,6}沿", spec):
@@ -2403,213 +1806,9 @@ def _scan_cfg_from_spec(spec, u, facts=None):
         if re.search(r"(?:插入|添加|需要|使用|加入)[^\n]{0,12}lockup", spec, re.I) \
                 or re.search(r"lockup\s*(?:latch|单元|cell)", spec, re.I):
             cfg["add_lockup"] = True
-            # 单时钟域没有跨域边界可插，唯一落点是链尾（手册 2.1.2.4）。
-            # 「多域」同时看网表事实与已抽取的时钟列表：t1/case2 有
-            # clk_i / bit_clk_pad_i 两个时钟，但只有一路真的驱动 FF，
-            # 光看 clock_ports 会误判成单域（golden 也没有 terminal lockup）。
-            _n_dom = max(len((facts or {}).get("clock_ports") or {}),
-                         len(u.get("clock_signals") or []))
-            if _n_dom <= 1 and "insert_terminal_lockup" not in cfg:
-                cfg["insert_terminal_lockup"] = True
-
-    # ── 内部时钟 / 负沿：从**网表事实**推导（有据才写）───────────────────
-    # 同一顶层时钟派生出的时钟叶子网络数 >=2 => 多个内部时钟域。
-    # 不设 -internal_clocks 时，工具不识别内部时钟域，这些叶子上的 FF 会被
-    # 当成同一域混插；探针实测 t1/case6 的 clk 派生 13 个叶子网络
-    # （n1/n2/n3… 各驱动上千 FF），golden 也正是 -internal_clocks single。
-    # **题面钉死链数时不做这个推断**（2026-11-02 v5 t1_01 实测）：
-    # 题面第 46 行把 set_scan_cfg 的参数逐项列全了 ——
-    #   `-chain_count 2 -max_length 500 -mix_clocks false -mix_edges false -add_lockup false`
-    # 里面**没有** -internal_clocks；我们从网表叶子推出 single 加进去后，
-    # 工具按内部门控时钟各建一条链，2 条变 **10 条**，链数验收直接失败。
-    # 链数是硬约束，而「内部时钟域划分」是优化项：硬约束优先，不在题面清单里就不加。
-    # 注意只挡**网表推断**这一条路 —— 下面的 `_ic` 分支（题面明写 single/multi/none）
-    # 仍然生效，t1/c6 那种「无 chain_count + 网表 13 个叶子」也照旧推 single。
-    _chain_pinned = bool(
-        re.search(r"-chain_count\s+\d+", spec)
-        or re.search(r"链数[^\n]{0,12}?(?:恰好|正好|固定|必须)[^\n]{0,8}?\d+", spec))
-    _leaves = (facts or {}).get("clock_leaf_nets") or {}
-    if "internal_clocks" not in cfg and not _chain_pinned:
-        for _port, _nets in _leaves.items():
-            if len(_nets) >= 2:
-                cfg["internal_clocks"] = "single"
-                break
-    # 任务书**明写**内部时钟策略时，以原文为准（比网表推导更权威，且 golden 会显式写）：
-    #   「全部同源同相，不构成独立时钟域」      -> none
-    #   「需按 `multi` 内部时钟策略处理」        -> multi
-    # 2026-10-31 第二轮新 case：5 个 golden 里 4 个都写了这条，我们一个都没写
-    # （或从网表推成 single，与题面相反）。
-    _ic = None
-    if re.search(r"按\s*`?multi`?\s*内部时钟|内部时钟[^\n]{0,12}multi|多输入组合逻辑", spec):
-        _ic = "multi"
-    elif re.search(r"按\s*`?single`?\s*内部时钟", spec):
-        _ic = "single"
-    elif re.search(r"不构成独立时钟域|同源同相|同源[^\n]{0,8}同相|同一时钟域|不产生内部时钟",
-                   spec):
-        _ic = "none"
-    if _ic:
-        cfg["internal_clocks"] = _ic
-    # 有经反相器（负沿）驱动的时钟 => 允许混沿，否则链会被按边沿拆开
-    if "mix_edges" not in cfg and ((facts or {}).get("clock_inverted") or {}):
-        cfg["mix_edges"] = True
 
 
-def spec_covers_icg_and_scan(spec):
-    """
-    题面是否要求**同一条** scan_enable 既管扫描单元、又管时钟门控。
-
-    手册依据（2.1.2.2 / 2.2.2）：
-      · `-usage all` ＝「指定给当前设计中所有即将插链的 Clock-Gating 和 Functional FF」
-      · 要给 Clock-Gating 的 TE 供使能，必须显式写 `-usage clock_gating` 或 `all`
-        —— 不写（或写 scan）时该使能只覆盖新链的 scan cell。
-
-    所以「一条使能既控制 shift/capture 又要让 ICG 在移位阶段保持导通」时，
-    正确取值是 `all`；否则 ICG 的 TE 拿不到这个使能。
-
-    判据按**同一行**判定（不复用全文里的零散词）—— 旧实现用
-    `re.search(r"(覆盖|包括)", spec)` 全文匹配，结果被 t2/c4 的
-    「扫描覆盖率 100%」命中，凭空把 `-usage scan` 升成 `all`（2026-11-01 查到）。
-
-    还要区分两种措辞（golden 佐证）：
-      · 「确保移位阶段所有 ICG 保持导通」    → ICG 已有自己的使能通路，写 scan 即可
-        （t2/c4 golden：`-port scan_cg_en_i`，不写 usage；题面同段还写了
-          「其门控使能为一个功能使能信号与 scan_cg_en_i 的逻辑或」→ 门控已接好）
-      · 「一条使能同时覆盖扫描 FF 与 ICG」   → 必须 all（t2/c1 golden 写 all）
-    所以只认「覆盖/兼顾/一并/同时」这类**明确合并两用途**的词。
-    """
-    if not spec:
-        return False
-    icg = re.compile(r"ICG|clock\s*gating|时钟门控", re.I)
-    scan = re.compile(r"扫描\s*(FF|单元|触发器)|SFF|shift\s*/\s*capture|shift/capture", re.I)
-    both = re.compile(r"覆盖(?!率)|兼顾|一并|同时(?:控制|驱动|管理)|既.{0,12}又")
-    # 题面是 markdown，一句话常被折成两行（t2/c1 第 54 行：
-    # 「4. 配置扫描使能（scan_enable）信号，新建端口 `test_se`，需覆盖」，
-    #  ICG/扫描单元写在下一行）。所以先按段落拼回逻辑文本再按窗口判定，
-    #  窗口取 ±80 字，避免把「扫描覆盖率 100%」这种验收句也算进来。
-    text = re.sub(r"[ \t]*\n[ \t]*(?![#|\-\d]\.)", " ", spec or "")
-    for m in both.finditer(text):
-        seg = text[max(0, m.start() - 80):m.end() + 80].replace("覆盖率", "")
-        if icg.search(seg) and scan.search(seg):
-            return True
-    return False
-
-
-def internal_clocks_from_spec(spec):
-    """
-    从 task_spec 确定性推导 `set_scan_cfg -internal_clocks` 的取值。
-
-    手册 p11 的三种取值：
-      · none   —— 不识别内部时钟域
-      · single —— 经**任意**组合逻辑门（含 buffer/inverter）后的时钟域视为单独内部时钟域
-      · multi  —— 经**多输入**组合逻辑门后的时钟域视为单独内部时钟域
-
-    为什么需要这条：这个参数以前**完全没有规则**，全凭模型填（LLM 的 schema 里有
-    这个字段）。结果是同一个设计模棱两可时模型给 `multi`，题面明确要求「不把门控
-    时钟当扫描时钟」时它也给 `multi` —— 直接改变工具对门控时钟的处理方式，
-    影响成链。2026-11-01 第五轮新 case 实测。
-
-    判据只在题面**明说**时生效（识别/排除内部时钟域的措辞），题面没提就返回 None，
-    由模型或工具默认决定 —— 不猜。
-    """
-    if not spec:
-        return None
-    # 题面**直接写出参数值**（v5 `t2_04_ac97_partition` 第 40 行：
-    # 「全局 `set_scan_cfg` 含 `-internal_clocks multi`」）。这种写法最权威，
-    # 优先于下面的自然语言推断 —— 之前的判据只认「按 multi 内部时钟」这类措辞，
-    # 直接写参数值的形态全部漏掉，导致题面要求 multi、我们却从网表推成 single。
-    # 公开 12 个 case 的题面**一个都没提** internal_clocks，所以这条零触发。
-    m = re.search(r"(?<![-\w])-internal_clocks\s+[\"'`]?(none|single|multi)\b",
-                  spec, re.I)
-    if m:
-        return m.group(1).lower()
-    # 排除：不识别内部时钟域
-    if re.search(r"(?:不使用|不作为|不采用|不识别|排除|禁用|忽略)[^\n]{0,14}"
-                 r"(?:内部时钟|门控时钟|内部时钟域|internal\s*clock)", spec, re.I):
-        return "none"
-    if re.search(r"(?:内部时钟|门控时钟|gated\s*clock)[^\n]{0,20}"
-                 r"(?:不作为|不用于|不参与|不纳入)[^\n]{0,12}(?:扫描时钟|扫描链时钟|scan\s*clock)",
-                 spec, re.I):
-        return "none"
-    # 识别：多输入组合逻辑 vs 任意（单输入）组合逻辑
-    if re.search(r"(?:多输入|多级|multiple[- ]input)[^\n]{0,12}"
-                 r"(?:组合逻辑|门控|gating)[^\n]{0,20}(?:内部时钟|时钟域)", spec, re.I):
-        return "multi"
-    if re.search(r"(?:单输入|任意|single[- ]input)[^\n]{0,12}"
-                 r"(?:组合逻辑|门)[^\n]{0,20}(?:内部时钟|时钟域)", spec, re.I):
-        return "single"
-    return None
-
-
-def _resolve_se_usage(se, se_list, spec_text, facts=None):
-    """
-    决定一条 `set_scan_signal -type scan_enable` 该不该写 `-usage`，写哪个。
-
-    手册 2.1.2.2：`-usage` 把该使能指定给「Clock-Gating」「Functional FF」或两者
-    （`all`）。不写时按工具默认（覆盖两者的那一档）。
-
-    取值的判据来自官方 golden 的分布（12 份里只有 2 份写 `-usage scan`）：
-
-      · t1/c5  pad_yy_scan_enable `-usage scan` + pad_yy_icg_scan_en `-usage clock_gating`
-        —— **另有使能负责门控**，这一条才是扫描专用
-      · t1/c3  pad_yy_test_mode 只有 `-off_state 0`（题面说它「同时控制 Clock Mux」，
-        一条信号管两类用途 → 默认档，不写）
-      · t2/c3  scan_cg_en 什么都不写（同一句说覆盖 SFF 与 ICG，依然不写）
-      · t2/c1  test_se `-usage all`（题面明确要求一条覆盖两类）
-
-    所以：`scan` 只在「门控另有其使能」或「题面明说该信号只管扫描单元」时保留；
-    其余一律省略（默认覆盖更广，且少写一个可能与 golden 冲突的参数）。
-    """
-    usage = normalize_usage(se.get("usage"))
-    if usage != "scan":
-        return usage
-    port = str(se.get("port") or "")
-    others = [o for o in (se_list or []) if str(o.get("port") or "") != port]
-    if any(normalize_usage(o.get("usage")) in ("clock_gating", "all") for o in others):
-        return "scan"                       # 门控另有使能，这条是扫描专用（t1/c5）
-    if re.search(
-            r"(?:仅|只|专门)(?:用于|负责|控制|驱动)[^\n]{0,12}"
-            r"(?:扫描单元|扫描触发器|SFF|scan\s*cell|shift\s*/\s*capture)", spec_text or "", re.I):
-        return "scan"
-    # 唯一/主使能：省略 -usage（工具默认覆盖扫描单元与门控两档），
-    # 需要显式声明覆盖门控时由 _usage_all_when_both_purposes 先改成 all。
-    return None
-
-
-def _usage_all_when_both_purposes(spec, u):
-    """
-    「一个使能同时管扫描 FF 与 ICG」→ `-usage all`（任务书写明才加）。
-
-    2026-10-31 新 case 实测：这类题写成
-        · 「`scan_cg_en` 一个信号同时覆盖扫描 FF 与全部 ICG」
-        · 「声明扫描使能 `se`，同时覆盖 SFF 与 ICG」
-    而 `sanitize_usage_by_spec` 只在**模型已经给了 all** 时才校验依据 ——
-    模型不给，就永远没有 `-usage all`，而 golden 都写。
-    这里补上正向抽取：同一句里"同时/兼" + 门控类词 + 扫描类词 → all。
-    """
-    lst = (u or {}).get("scan_enable_signals")
-    if not isinstance(lst, list):
-        return
-    for item in lst:
-        if not isinstance(item, dict):
-            continue
-        port = str(item.get("port") or "")
-        if not port:
-            continue
-        for line in (spec or "").splitlines():
-            if port not in line:
-                continue
-            if not re.search(r"同时|兼|既|一并", line):
-                continue
-            gating = re.search(r"ICG|门控|clock\s*gating|clock_gating", line, re.I)
-            scanning = re.search(r"扫描|shift|capture|\bSE\b|SFF|\bFF\b|移位", line, re.I)
-            if gating and scanning:
-                # 题面说"同时覆盖扫描单元与时钟门控two类用途"时，all 是**结论**，
-                # 不该被其他规则先算出的 clock_gating 挡住（v5 的 t1/c1、t1/c2 就是这样）。
-                item["usage"] = "all"
-                break
-
-
-def _rule_signals_from_spec(spec, u, facts=None):
+def _rule_signals_from_spec(spec, u):
     """
     从 task_spec 抽取「明确要求配置 / 排除」的 DFT 信号（无 golden 时的兜底来源）。
 
@@ -2679,21 +1878,6 @@ def _rule_signals_from_spec(spec, u, facts=None):
         else:
             existing.setdefault("usage", "clock_gating")
             existing.setdefault("off_state", 1)
-    #   a6) 题面配置清单里的 off_state —— public/task_1/case3 第 71 行原文：
-    #       「1 个 `scan_enable` 信号（off_state = 0）。该信号同时控制 Clock Mux…」
-    #       这一行**不含端口名**（端口名在第 56 行的表格里），
-    #       `_explicit_off_state(spec, port)` 按端口过滤行 → 永远返回 None，
-    #       off_state 就丢了（golden 写 `-off_state 0`，我们输出成 `-usage scan`，
-    #       语义收窄到「只覆盖扫描触发器」，与任务书不符）。
-    #       只在该值**唯一**时套用：多个使能有不同 off_state 时（如 case1 的
-    #       scan_enable / icg_scan_en）不做一刀切。
-    _se_off = _se_off_state_from_spec(spec)
-    if _se_off is not None and len(u["scan_enable_signals"]) == 1:
-        # 只有一个使能才套用：case1 那种「pad_yy_scan_enable(scan) +
-        # pad_yy_icg_scan_en(clock_gating, off_state 1)」如果一刀切，
-        # 会把主使能也写成 off_state 1。
-        for _se in u["scan_enable_signals"]:
-            _se.setdefault("off_state", _se_off)
 
     # (b) clock / reset
     #     触发句：'…为扫描时钟' / '…均配置为时钟信号' / '…为低有效复位' / '…配置为复位信号'
@@ -2715,11 +1899,7 @@ def _rule_signals_from_spec(spec, u, facts=None):
                         continue      # '…__sdlclkp_1' 这类门控单元类型名不是时钟端口
                     if re.search(r"clk|clock", t, re.I) and \
                        not any(c.get("port") == t for c in u["clock_signals"]):
-                        _clk = {"port": t}
-                        _off = _explicit_off_state(seg, t)
-                        if _off is not None:
-                            _clk["off_state"] = _off
-                        u["clock_signals"].append(_clk)
+                        u["clock_signals"].append({"port": t, "off_state": 0})
             elif rst_req.search(seg):
                 low = bool(re.search(r"低有效|低电平有效|active[\s_-]*low", seg, re.I))
                 for t in seg_toks:
@@ -2732,41 +1912,8 @@ def _rule_signals_from_spec(spec, u, facts=None):
                     if not any(r.get("port") == t for r in u["reset_signals"]):
                         u["reset_signals"].append({"port": t, "off_state": off})
 
-    # (b1.5) 复位/置位**表格**：`| `rst_n` | 低有效 | 必须置为无效态（高） |`
-    #
-    # 2026-10-31 第二轮新 case 的 t1/c2：复位/置位只出现在表格里，
-    # 正文那句「声明 `rst_n`、`set_n` 为复位信号」被旧逻辑按"没有复位端口"漏掉，
-    # 结果两条 reset 声明一条都没有（golden 有，且极性 1）。
-    for line in spec.splitlines():
-        if not line.strip().startswith("|"):
-            continue
-        cells = [c.strip().strip("`") for c in line.strip().strip("|").split("|")]
-        if len(cells) < 2:
-            continue
-        name = cells[0]
-        if not re.fullmatch(r"[A-Za-z_]\w{0,31}", name):
-            continue
-        if "__" in name:
-            continue        # 库单元类型（`sky130_fd_sc_hd__dfrtp_1`）不是端口，
-                            # 时序单元表的"低电平有效复位"描述会把它们误当复位端口
-        body = " ".join(cells[1:])
-        if not re.search(r"低有效|低电平有效|高有效|高电平有效", body):
-            continue
-        # 只认"像复位"的：名字带 rst/reset/set/clr，或该行确实写了复位/置位
-        if not (re.search(r"rst|reset|set|clr", name, re.I)
-                or re.search(r"复位|置位", body)):
-            continue
-        if any(r.get("port") == name for r in u["reset_signals"]):
-            continue
-        low = bool(re.search(r"低有效|低电平有效", body))
-        u["reset_signals"].append({"port": name, "off_state": 1 if low else 0})
-
     # (b2) 常数锁定：'`pad_yy_scan_mode` 锁定为 1（扫描模式）'
-    #      表格里最常见的写法是 `| `pad_yy_scan_mode` | 锁定为 1（…）|`，
-    #      名字与「锁定为」之间隔着表格分隔符 `|`，所以要允许竖线。
-    #      （2026-10-31 新 case 实测：t1/c4 的两条常量就是这么漏掉的）
-    for m in re.finditer(
-            r"`([A-Za-z_]\w*)`\s*\|?\s*(?:端口\s*)?(?:锁定|固定|置)为\s*([01])\b", spec):
+    for m in re.finditer(r"`([A-Za-z_]\w*)`\s*(?:端口\s*)?(?:锁定|固定|置)为\s*([01])\b", spec):
         port, val = m.group(1), int(m.group(2))
         if not any(c.get("port") == port for c in u["constant_signals"]):
             u["constant_signals"].append({"port": port, "value": val})
@@ -2775,40 +1922,10 @@ def _rule_signals_from_spec(spec, u, facts=None):
     for m in re.finditer(r"时钟端口[^\n`]{0,12}`([A-Za-z_]\w*)`", spec):
         port = m.group(1)
         if not any(c.get("port") == port for c in u["clock_signals"]):
-            _clk = {"port": port}
-            _off = _explicit_off_state(spec, port)
-            if _off is not None:
-                _clk["off_state"] = _off
-            u["clock_signals"].append(_clk)
+            u["clock_signals"].append({"port": port, "off_state": 0})
 
     # (b4) 「时钟结构」类表格（表头为『时钟信号 / 时钟端口』）
     _clock_from_tables(spec, u)
-
-    # (b5) ICG 的扫描控制端由某顶层端口驱动 → 该端口是 scan_enable（clock_gating）
-    #
-    # 依据（2026-10-28 t1/case4）：任务书写
-    #     「…其扫描控制端（ICG 单元的 SCE 引脚）改为由顶层端口 `pad_yy_gate_clk_en_b` 驱动」
-    # golden 对应 `set_scan_signal -type scan_enable -port pad_yy_gate_clk_en_b -usage clock_gating`。
-    # 这是确定性句式：端口名 + ICG 控制端 + 驱动关系，三者都在一句话里。
-    # 纯规则路径此前完全漏掉这个信号（case4 唯一差异），LLM 也没抽到 —— 说明
-    # 「ICG 的 SCE 由谁驱动」这类表述不在两份实现的覆盖里，这里补上。
-    for m in re.finditer(
-            r"(?:SCE|TE|scan[_ ]?control|扫描控制)[^\n]{0,40}?"
-            r"(?:顶层端口|端口|port)\s*`?([A-Za-z_]\w*)`?\s*(?:驱动|控制)",
-            spec, re.I):
-        port = m.group(1)
-        if not any(c.get("port") == port for c in u["scan_enable_signals"]):
-            u["scan_enable_signals"].append(
-                {"port": port, "usage": "clock_gating"})
-    # 反向语序：「顶层端口 `X` 驱动…ICG 的 SCE/TE」
-    for m in re.finditer(
-            r"(?:顶层端口|端口)\s*`?([A-Za-z_]\w*)`?[^\n]{0,30}?"
-            r"(?:驱动|控制)[^\n]{0,30}?(?:SCE|ICG\s*单元|门控单元)",
-            spec, re.I):
-        port = m.group(1)
-        if not any(c.get("port") == port for c in u["scan_enable_signals"]):
-            u["scan_enable_signals"].append(
-                {"port": port, "usage": "clock_gating"})
 
 
     # (c) ICG 排除（排除反义表述：「模块不含 ICG，无需 ICG 排除设置」）
@@ -2847,7 +1964,7 @@ def _rule_signals_from_spec(spec, u, facts=None):
         u["scan_cfg"]["so_port_format"] = m.group(1)
 
     # (f) 扫描链配置（最大链长 / 混时钟 / 混沿）—— 无 golden 时的关键来源
-    _scan_cfg_from_spec(spec, u, facts)
+    _scan_cfg_from_spec(spec, u)
 
 
 def _merge_sig(lst, sig):
@@ -2933,10 +2050,6 @@ def _merge_ref_dofile_signals(task, u, merge_signals=None):
 
     # 扫描链配置（set_scan_cfg，常为多行续行写法）—— 参考 dofile 的值最权威
     _scan_cfg_from_ref(ref, u)
-    # 但**任务书明写的极性/开关**要压过参考 dofile：task_2 的 original.dofile 里
-    # `-mix_clocks true` 往往正是被注入的错，照着抄就把题面的「不混时钟域」丢了
-    # （2026-10-31 t2/c1、t2/c2：我们 true、golden false）。
-    _reapply_explicit_switches(task, u)
 
     for m in re.finditer(
             r'set_dft_clock_gating_cfg[^\n]*?-exclude_elements\s+'
@@ -3082,20 +2195,6 @@ def _wrapper_cfg_from_spec(spec, u):
     cfg["enabled"] = True
     cfg.setdefault("style", "shared")
 
-    # 全局 style：「启用 Wrapper（dedicated 模式）」。
-    # 漏这一条会直接把 dedicated 写成 shared（t1/case3 实测：golden 是 dedicated，
-    # 我们一直输出 shared，而工具行为完全不同 —— wrapper cell 的插法变了）。
-    m = re.search(r"启用\s*wrapper\s*[（(]\s*(dedicated|shared)\s*模式", spec, re.I) \
-        or re.search(r"[（(]\s*(dedicated|shared)\s*模式\s*[）)]", spec, re.I)
-    if m:
-        cfg["style"] = m.group(1).lower()
-
-    # wrapper 链数：「wrapper chain 数目要求为 15 条」。
-    # 这是**显式验收项**（wrapper 15 + unwrapper 55），不写就由工具自行推导。
-    m = re.search(r"wrapper\s*chain\s*(?:数目|数量)?[^\n]{0,12}?(\d+)\s*条", spec, re.I)
-    if m:
-        cfg["chain_count"] = int(m.group(1))
-
     m = re.search(r"reuse_threshold[^\d\-]{0,16}(-?\d+)", spec, re.I) \
         or re.search(r"复用阈值[^\d\-]{0,16}(-?\d+)", spec)
     if m:
@@ -3106,16 +2205,11 @@ def _wrapper_cfg_from_spec(spec, u):
     if m:
         cfg["depth_threshold"] = int(m.group(1))
 
-    # 「其余端口使用 shared wrapper」—— 具体是哪几个端口要靠顶层端口表推，
-    # 见 reconcile_wrapper_cfg（规则层这里只记下这个意图）。
-    if re.search(r"其余端口[^\n]{0,16}?shared", spec, re.I):
-        cfg["shared_rest"] = True
-
     # 全局链长上限（与 scan_cfg 共用同一判据）
     if "max_length" not in cfg:
         m = _MAX_LEN_RE.search(spec)
         if m:
-            cfg["max_length"] = int(m.group(1) or m.group(2))
+            cfg["max_length"] = int(m.group(1))
 
     # 按端口策略 —— 顺序即 task_spec 出现顺序
     per_port, seen = [], set()
@@ -3138,222 +2232,29 @@ def _wrapper_cfg_from_spec(spec, u):
     if per_port:
         cfg["port_specific"] = per_port
 
-    # 2026-10-31 新 case 的两种写法（旧正则要求先出现"端口"二字，这里都不满足）：
-    #   表格：`| key1 | 密钥输入通道 1，仅传输功能数据，不参与扫描路径 |`
-    #   箭头：`按端口分别配置：key1 → none；key2 → dedicated（使用用户自定义 cell）；key3 → shared (WC_S1)`
-    for m in re.finditer(
-            r"`([A-Za-z_]\w*)`\s*(?:→|->)\s*(none|dedicated|shared)", spec, re.I):
-        port, style = m.group(1), m.group(2).lower()
-        if port in seen:
-            continue
-        seen.add(port)
-        item = {"port": port, "style": style}
-        if style == "dedicated":
-            item["dedicated_cell_type"] = "user_defined"
-        per_port.append(item)
-    for line in spec.splitlines():
-        if not line.strip().startswith("|"):
-            continue
-        cells = [c.strip().strip("`") for c in line.strip().strip("|").split("|")]
-        if len(cells) < 2:
-            continue
-        port = cells[0]
-        if not re.fullmatch(r"[A-Za-z_]\w{0,31}", port) or port in seen:
-            continue
-        body = " ".join(cells[1:])
-        style = None
-        if re.search(r"不参与扫描|仅传输功能数据|不使用\s*wrapper", body):
-            style = "none"
-        elif re.search(r"dedicated", body, re.I):
-            style = "dedicated"
-        elif re.search(r"shared", body, re.I):
-            style = "shared"
-        if not style:
-            continue
-        seen.add(port)
-        item = {"port": port, "style": style}
-        if style == "dedicated":
-            item["dedicated_cell_type"] = "user_defined"
-        per_port.append(item)
-    if per_port:
-        cfg["port_specific"] = per_port
+    # 移位 / 捕获测试使能信号 —— task_spec 要求「需正确配置，端口名自拟」，
+    # 因此用规范命名（网表中不存在这些端口，工具会自动创建）。
+    # 类型名取自命令白名单：wrp_in_shift_en / wrp_out_shift_en /
+    # wrp_in_capture_en / wrp_out_capture_en。
+    names = {
+        "wrp_in_shift_en": "wrapper_in_shift_en",
+        "wrp_out_shift_en": "wrapper_out_shift_en",
+        "wrp_in_capture_en": "wrapper_in_cap_en",
+        "wrp_out_capture_en": "wrapper_out_cap_en",
+    }
+    cfg["enabled_signals"] = names
 
-    # 「允许混用单元（`mix_cell true`）」/「shared wrapper 使用 `WC_S1`」
-    if re.search(r"mix_cell\s+true|允许混用单元|混用单元", spec, re.I):
-        cfg["mix_cell"] = True
-    m = re.search(r"shared\s*wrapper[^\n]{0,24}?(?:使用|用)\s*`?([A-Za-z]\w*)`?",
-                  spec, re.I)
-    if m and not re.fullmatch(r"(?i)true|false", m.group(1)):
-        cfg["shared_cell_type"] = m.group(1)
-
-    # 移位 / 捕获测试使能信号 —— **只有题面要求配置时才声明**（端口名自拟）。
-    #
-    # 判据（2026-11-01，public 双样本）：
-    #   · t1/case6 题面第 43 行「wrapper 的移位/捕获测试使能信号需正确配置，端口名自拟」
-    #     → golden 写了 4 条 `set_scan_signal -type wrp_*_en` → 我们照写 ✅
-    #   · t1/case3 题面通篇没有这句话 → golden 一条没写 → 我们过去无条件写 5 条，
-    #     工具直接报 `[WARNING] [SCAN-4610] Port 'wrapper_out_shift_en' does not
-    #     exist in the design`（端口是我们编的，网表里根本没有）。
-    #
-    # 旧实现只要题面出现 "wrapper" 就无条件塞 5 条 —— 属于「题面没写却写了」，
-    # 与 HANDOFF §3 的口径（题面写了才写）冲突。
-    _want_wrap_en = re.search(
-        r"(?:移位|shift)\s*[/／、和与]\s*(?:捕获|capture)[^\n]{0,24}?(?:使能|enable)"
-        r"|(?:wrapper[^\n]{0,10})?(?:shift|capture)[^\n]{0,16}?(?:enable|使能)",
-        spec, re.I)
-    if _want_wrap_en:
-        names = {
-            "wrp_in_shift_en": "wrapper_in_shift_en",
-            "wrp_out_shift_en": "wrapper_out_shift_en",
-            "wrp_in_capture_en": "wrapper_in_cap_en",
-            "wrp_out_capture_en": "wrapper_out_cap_en",
-        }
-        cfg["enabled_signals"] = names
-
-        # wrapper 时钟：复用顶层扫描时钟（与使能信号同进同出：
-        # t1/case6 的 golden 写了 `set_scan_signal -type wrapper_clock -port clk`，
-        # t1/case3 的 golden 一条 wrapper 信号都没有）
-        clk_port = ""
-        for c in u.get("clock_signals") or []:
-            if c.get("port"):
-                clk_port = c["port"]
-                break
-        wsigs = []
-        if clk_port:
-            wsigs.append({"type": "wrapper_clock", "port": clk_port})
-        wsigs += [{"type": t, "port": n} for t, n in names.items()]
-        u.setdefault("wrapper_signals", []).extend(wsigs)
-
-
-_WRAPPER_SPEC_KEYS = ("style", "chain_count", "max_length", "reuse_threshold",
-                      "depth_threshold", "shared_cell_type", "mix_cell",
-                      "mix_internal_clocks", "port_specific", "shared_rest")
-
-
-def reconcile_wrapper_cfg(u, task, facts=None):
-    """
-    装配完成后，把 Wrapper 配置拉回「说明书说了什么」这一把尺子上。
-
-    为什么需要：`apply_plan` 的 author 模式里 `wrapper_cfg` 是**整体替换**，LLM 少写
-    几条就会把规则层推出来的配置顶掉；更糟的是它会「凑数」——
-    t1/case3 说明书里「wrapper chain 15 条 / unwrapper chain 55 条」被模型
-    当成了 `-reuse_threshold 15 -depth_threshold 55` 写进全局配置，而说明书
-    一个字都没提这两个阈值（golden 也没有）。
-
-    做法（三件事，全部有据可依）：
-      1. **没有据就删**：reuse_threshold / depth_threshold / mix_cell /
-         mix_internal_clocks 只有在说明书原文出现时才保留；
-      2. **有据就补**：style / chain_count / max_length 从说明书重新取一遍；
-      3. **按端口策略保留规则层的结论**（key1→none、key2→dedicated 这类是验收项）。
-    """
-    cfg = u.get("wrapper_cfg") or {}
-    if not cfg or not cfg.get("enabled"):
-        return u
-    spec = (task or {}).get("task_spec", "") or ""
-
-    def _evidenced(key, *pats):
-        return any(re.search(p, spec, re.I) for p in pats)
-
-    # 1) 无据则删
-    if not _evidenced("reuse", r"reuse_threshold", r"复用阈值"):
-        cfg.pop("reuse_threshold", None)
-    if not _evidenced("depth", r"depth_threshold", r"深度阈值"):
-        cfg.pop("depth_threshold", None)
-    if not _evidenced("mix_cell", r"mix_cell", r"混合\s*(?:不同的)?\s*单元"):
-        cfg.pop("mix_cell", None)
-    if not _evidenced("mix_internal", r"mix_internal_clocks", r"内部时钟"):
-        cfg.pop("mix_internal_clocks", None)
-    if not _evidenced("shared_cell", r"shared_cell_type", r"WC_S"):
-        # shared_cell_type 说明书通常不点名（"尊重工具的推导结果"），
-        # 由工具默认值决定；模型若自己填了个单元名，反而可能不存在。
-        cfg.pop("shared_cell_type", None)
-
-    # 2) 有据则补（说明书是唯一依据，覆盖模型的手写值）
-    m = re.search(r"启用\s*wrapper\s*[（(]\s*(dedicated|shared)\s*模式", spec, re.I) \
-        or re.search(r"[（(]\s*(dedicated|shared)\s*模式\s*[）)]", spec, re.I)
-    if m:
-        cfg["style"] = m.group(1).lower()
-    m = re.search(r"wrapper\s*chain\s*(?:数目|数量)?[^\n]{0,12}?(\d+)\s*条", spec, re.I)
-    if m:
-        cfg["chain_count"] = int(m.group(1))
-    if not cfg.get("max_length"):
-        m = _MAX_LEN_RE.search(spec)
-        if m:
-            cfg["max_length"] = int(m.group(1) or m.group(2))
-
-    # 3) 按端口策略：保留已有条目（顺序即说明书出现顺序）
-    ports = list(cfg.get("port_specific") or [])
-    # 「其余端口使用 shared wrapper」不展开成逐端口命令：全局 `-style shared`
-    # 已经覆盖它们，再逐个端口写一遍属于冗余（golden 只挑了 key3 写一条，
-    # 那条与不写等价，见 tools/_golden_compare._drop_unspecified_wrapper）。
-    cfg.pop("shared_rest", None)
-    # style 收敛到合法枚举（说明书给了就用说明书的，没给就用模型的，非法则 shared）
-    cfg["style"] = _wrapper_style(cfg.get("style"))
-    for ps in cfg.get("port_specific") or []:
-        ps["style"] = _wrapper_style(ps.get("style"))
-    if ports:
-        cfg["port_specific"] = ports
-    u["wrapper_cfg"] = cfg
-    return u
-
-
-# 「除了 <pat> 之外都不允许串链」—— t1/case3 的验收原文：
-#   对 Hinstance：`X` 下的所有可扫描单元，除了 `X/mintthresh*` 可匹配到的扫描单元，
-#   其余均不允许参与扫描链串链。
-# 只写 false X 会把这整棵子树排除掉，连 mintthresh* 一起排掉 —— 少写 true 那句话
-# 等于把「例外」也砍了，功能上是错的。
-_SCAN_ELEM_EXCEPT_RE = re.compile(
-    r"对\s*Hinstance[：:]\s*`?([\w./]+)`?[^\n]{0,80}?除了\s*`?([\w./*]+)`?")
-# 「`X` 下的可扫描单元除 `mintthresh*` 外均不上链」
-#
-# 与上面那条是同一个语义（整体排除 X、再把 X/mintthresh* 收回），只是句式不同：
-# 不写「对 Hinstance：」，也不用「除了」。2026-10-31 新 case 的 t2/c4 正是这种，
-# 结果 include 一条都没有，验收项「mintthresh 重新纳入」直接做不到。
-_SCAN_ELEM_EXCEPT_RE_ALT = re.compile(
-    r"`([\w./]+)`\s*下的?[^\n]{0,24}?除\s*`([\w./*]+)`\s*外")
-_SCAN_ELEM_EXCLUDE_RE = re.compile(
-    r"对\s*Hinstance[：:]\s*`?([\w./]+)`?[^\n]{0,80}?((?:不允许|不得|禁止)[^\n]{0,20}?串链)")
-# 「该实例内部的所有触发器均为普通 DFF」——等价于「这个实例不可扫描」。
-# t1/case4 原文：网表中已存在少量扫描 FF，全部位于 `X` 实例内部；最终网表中，
-# `X` 实例内部的所有触发器均为普通 DFF。golden 的做法是
-# `-replace_unscan` + `set_scan_element false X` 双管齐下，只做前者时实例内的
-# 既有 SFF 仍可能被工具串进链里。
-_SCAN_ELEM_PLAIN_DEF_RE = re.compile(
-    r"最终网表中[，,]?\s*`?([\w./]+)`?\s*实例内部[^\n]{0,24}?(?:普通\s*DFF|回替)")
-
-
-def _scan_element_from_spec(spec, u):
-    """从说明书抽「排除出扫描链」与它的**例外模式**（set_scan_element false/true）。"""
-    if not spec:
-        return
-    ex = list(u.get("scan_element_exclude") or [])
-    inc = list(u.get("scan_element_include") or [])
-    for m in _SCAN_ELEM_EXCEPT_RE.finditer(spec):
-        base, pat = m.group(1), m.group(2)
-        if base not in ex:
-            ex.append(base)
-        if pat not in inc:
-            inc.append(pat)
-    # 「X 下…除 mintthresh* 外均不上链」：例外是 X 内部的**名字前缀**，要拼成 X/pat。
-    for m in _SCAN_ELEM_EXCEPT_RE_ALT.finditer(spec):
-        base, pat = m.group(1), m.group(2)
-        if base not in ex:
-            ex.append(base)
-        full = f"{base}/{pat}"
-        if full not in inc:
-            inc.append(full)
-    for m in _SCAN_ELEM_EXCLUDE_RE.finditer(spec):
-        base = m.group(1)
-        if base not in ex:
-            ex.append(base)
-    for m in _SCAN_ELEM_PLAIN_DEF_RE.finditer(spec):
-        base = m.group(1)
-        if base not in ex:
-            ex.append(base)
-    if inc:
-        u["scan_element_include"] = inc
-    if ex:
-        u["scan_element_exclude"] = ex
+    # wrapper 时钟：复用顶层扫描时钟（task_1/case6 原文「wrapper 时钟 — 复用 clk 端口」）
+    clk_port = ""
+    for c in u.get("clock_signals") or []:
+        if c.get("port"):
+            clk_port = c["port"]
+            break
+    wsigs = []
+    if clk_port:
+        wsigs.append({"type": "wrapper_clock", "port": clk_port})
+    wsigs += [{"type": t, "port": n} for t, n in names.items()]
+    u.setdefault("wrapper_signals", []).extend(wsigs)
 
 
 # 时序单元基名：df*/edf* 为功能 DFF，sdf*/sedf* 为对应扫描单元
@@ -3478,14 +2379,10 @@ def _rule_extract_understanding(task, facts=None):
     #      (2) 库命名规律（facts.scan_mappings，见 netlist_facts._derive_cell_mappings）：
     #          对设计里实际存在的 DFF 类型，取库中同前缀加 's' 的扫描单元。
     #    第 (2) 层是**通用**依据：scan 单元的标准命名约定，不依赖任务书措辞。
-    # 【2026-10-27 去掉「按库命名规律自动补映射」这一层】
-    # 依据官方 golden：task_1 的 6 个 public case 里只有 case1 有
-    # `set_scan_cell_mapping`（4 条，正对应任务书里的那张 DFF|SFF 表），
-    # 其余 5 个 golden **一条都没有** —— 而我们的自动补全会给每个 DFF 类型都加一对
-    # （case1 变 6 对、case5 凭「所有 DFF 已替换为扫描 FF」这句就补 8 对）。
-    # 工具的 `replace` 默认就是 True（scan_cfg.rpt 实测），即"替换"由工具自己做，
-    # 只有任务书明确给出对照表时才需要显式映射。
     u["scan_cell_mappings"] = _cell_mappings_from_spec(spec)
+    for dff, sff in (facts or {}).get("scan_mappings") or []:
+        if not any(p[0] == dff for p in u["scan_cell_mappings"]):
+            u["scan_cell_mappings"].append([dff, sff])
     # 归一化到 Liberty 库里的**全名**：任务书常用短名（`dfxtp_1`），而命令必须写全名；
     # 库里查不到对应单元的映射对直接丢弃（写了会被工具报错）。
     u["scan_cell_mappings"] = _canonical_cell_mappings(
@@ -3494,13 +2391,10 @@ def _rule_extract_understanding(task, facts=None):
     # 2. DFT 信号 / ICG 排除 / 不可扫描元素 / 扫描端口命名：
     #    以 task_spec 原文表格与要求句为准（hidden case 没有 golden，
     #    旧实现只在 golden 存在时才生成这些配置，评测时会整段丢失）。
-    _rule_signals_from_spec(spec, u, facts)
+    _rule_signals_from_spec(spec, u)
 
     # 2.5 Wrapper 配置（复用阈值 / 深度阈值 / 全局与按端口 style）
     _wrapper_cfg_from_spec(spec, u)
-
-    # 2.6 扫描元素排除与它的例外模式（set_scan_element false / true）
-    _scan_element_from_spec(spec, u)
 
     # 3. 参考 dofile 增强（public case）：golden / original 里已写明的配置更权威，
     #    合并时按端口名与路径末段去重，并保留更完整的层级路径。
@@ -3524,128 +2418,7 @@ def _rule_extract_understanding(task, facts=None):
     # 同为「端口必须真实存在」的姊妹判据：功能时钟不是扫描时钟。
     drop_functional_clock_ports(u, spec)
 
-    # 7. 分区骨架 / 扫描使能兜底：说明书写了「按时钟域划分分区」「需要扫描使能」，
-    #    但没给实例表 / 没点名端口时，过去是**整块消失**（见两个函数的说明）。
-    _partition_skeleton_from_clocks(spec, u, facts, chain_plan=spec_chain_plan(spec))
-    _scan_enable_fallback_from_ports(spec, u, facts)
-
-    # 8. 一个使能同时覆盖扫描 FF 与 ICG → `-usage all`。
-    #    **必须排在兜底之后**：兜底那一步才会把"题面要求使能但没点名端口"的候选
-    #    补进列表（t1/c1 的 scan_cg_en 就是这么来的），排前面只会扫到空列表。
-    _usage_all_when_both_purposes(spec, u)
-
     return u
-
-
-def _partition_skeleton_from_clocks(spec, u, facts, chain_plan=None):
-    """
-    任务书要求「按时钟域/功能区域划分扫描分区」但**没有实例表**时的确定性骨架。
-
-    2026-10-30 新 case 复盘：一个明确要求按时钟域划分分区的插链任务，我们既没有
-    `add_scan_partition` 也没有 `set_scan_signal -type scan_enable` —— 因为分区
-    生成完全挂在「| 分区 | chain_count |」表格上（`assign_partitions` 只在有表时
-    才调 LLM），没有表就整块消失。工具对无分区的设计照样能插链，但「按时钟域隔离」
-    这条验收项直接为 0，而且没有任何报错提示。
-
-    这里只做**结构性骨架**：每个顶层时钟域一个分区（`-clocks {clk}`），
-    chain_count 按该时钟驱动的 FF 数 ÷ 最大链长估算。实例归属交给工具（它自己
-    知道谁挂在哪个时钟上），比我们瞎划实例安全。
-    """
-    if u.get("partitions"):
-        return
-    if not spec or not re.search(r"分区|partition", spec, re.I):
-        return
-    if _PARTITION_TABLE_RE.search(spec):
-        return                      # 有实例表 -> 走 assign_partitions（LLM 划分）
-    clocks = [c for c in (u.get("clock_signals") or [])
-              if str(c.get("port") or "").strip()
-              and str(c.get("port")).strip() not in set(u.get("pseudo_pi") or [])]
-    ports = (facts or {}).get("clock_ports") or {}
-    clocks = [c for c in clocks if not ports or c["port"] in ports]
-    if len(clocks) < 2:
-        return                      # 单时钟域没有"划分"可言
-    max_len = tcl_scalar((u.get("scan_cfg") or {}).get("max_length")) or \
-        partition_max_length({"task_spec": spec})
-    parts = []
-    # 题面给了「三域分别为 27 / 3 / 2 条」这类逐域链数时，**按时钟顺序直接取**，
-    # 比按 FF 数估算准得多（2026-10-31 v5 的 t1/c3：我们估成 1/1/1，题面要 27/3/2）。
-    _dom = list((chain_plan or {}).get("domains") or [])
-    for i, c in enumerate(clocks[:8]):
-        port = str(c["port"]).strip()
-        ff = int(ports.get(port) or 0)
-        if len(_dom) == len(clocks):
-            cnt = _dom[i]
-        else:
-            cnt = max(1, -(-ff // int(max_len))) if (ff and max_len) else 1
-        parts.append({"name": f"{port}_partition", "desc": f"时钟域 {port}",
-                      "clocks": [port], "chain_count": cnt})
-    # 题面写「每域/每分区独立扫描使能」时，把 se 端口按名字绑定到各自分区。
-    #
-    # 依据（2026-10-31 v5 的 t1/c3）：题面要求「每个分区配置独立的扫描使能端口」，
-    # 网表顶层有 se_wb / se_tx / se_rx —— 只生成 -clocks 分区而不声明这些 SE，
-    # 等于分区在测试态没有自己的使能，验收直接挂。
-    # 绑定**必须唯一**：端口 token 与时钟 token 能对上才写，写不准就不写。
-    if re.search(r"(?:每(?:个|一)(?:分区|时钟域|域)|分别)[^\n]{0,24}"
-                 r"(?:独立|单独)[^\n]{0,12}(?:扫描使能|scan\s*enable|SE)", spec, re.I):
-        se_ports = [p for p in (facts or {}).get("top_ports") or []
-                    if re.search(r"(^|_)(se|scan_en|scan|te|test)(_|$)", p, re.I)]
-        declared = {str(s.get("port") or "") for s in u.get("scan_enable_signals") or []}
-        for part in parts:
-            if part.get("se"):
-                continue
-            # 不直接取 part["clocks"][0]：分区的时钟可能为空（按实例划分的分区表），
-            # 那时没有「时钟 token」可用于推导 se 名字，跳过即可。
-            _clks = part.get("clocks") or []
-            if not _clks:
-                continue
-            clk = _clks[0]
-            toks = set(re.split(r"[_\W]+", clk.lower())) - {"", "clk", "clock", "pad", "i"}
-            cands = [p for p in se_ports if any(t and t in p.lower() for t in toks)]
-            if not cands:
-                # 顶层根本没有现成的 SE 端口（v5/t1/c3 顶层只有 wb_sel_i）：
-                # 题面要求"每域独立使能"，那就**按时钟 token 造一个** ——
-                # `wb_clk_i`→se_wb、`mtx_clk_pad_i`→se_tx、`mrx_clk_pad_i`→se_rx。
-                # 新端口由 generate_from_config 的 add_port 段落创建（手册允许新建）。
-                stem = (sorted(toks, key=lambda x: (len(x), x)) or [clk])[0]
-                cands = [f"se_{stem}"]
-            if len(cands) == 1:
-                part["se"] = cands[0]
-                if cands[0] not in declared:
-                    u.setdefault("scan_enable_signals", []).append({"port": cands[0]})
-                    declared.add(cands[0])
-    u["partitions"] = parts
-    u.setdefault("notes", []).append(
-        "任务书要求按时钟域划分分区但没有实例表：已按时钟域生成 "
-        f"{len(parts)} 个分区骨架（-clocks 形式）")
-
-
-def _scan_enable_fallback_from_ports(spec, u, facts):
-    """
-    说明书要求扫描使能、但一条都没解析出来时的兜底：只有一个"像测试/扫描"的顶层端口才认。
-
-    判据刻意保守：候选必须**唯一**，且端口名带 test/scan/te/se/shift 语义。
-    宁可少写（工具会报 SCAN-4610 之类的警告）也不要写错端口 —— 写错会让整条链
-    在 capture 态行为不对，比缺失更难查。
-    """
-    if u.get("scan_enable_signals"):
-        return
-    if not spec or not re.search(r"扫描使能|scan\s*enable|scan_en", spec, re.I):
-        return
-    ports = list((facts or {}).get("top_ports") or {})
-    if not ports:
-        return
-    taken = set()
-    for key in ("clock_signals", "reset_signals", "constant_signals"):
-        for s in u.get(key) or []:
-            taken.add(str(s.get("port") or ""))
-    cands = [p for p in ports
-             if p not in taken
-             and re.search(r"(^|_)(test|scan|te|se|shift)(_|$)", p, re.I)]
-    if len(cands) != 1:
-        return
-    u["scan_enable_signals"] = [{"port": cands[0]}]
-    u.setdefault("notes", []).append(
-        f"任务书要求扫描使能但未点名端口：按顶层唯一候选 {cands[0]} 声明")
 
 
 
@@ -3728,29 +2501,10 @@ def _drop_non_port_clocks(u, facts):
     ports = (facts or {}).get("top_ports") or {}
     if not ports:
         return
-    # 伪主输入（pseudo PI）本来就是**内部路径**，按定义不在顶层端口表里，
-    # 但它们必须保留 -type clock 声明（手册固定搭配：add_pseudo_pi + 同路径
-    # set_scan_signal -type clock）。平台实测 task_1/case5：这里把 9 个伪主输入的
-    # clock 声明全删掉 → 9 个时钟域不可控 → `Nonscannable FF Count = 69022`，
-    # 与 DRC 的 `DFTR1×69022` 精确相等。
-    pseudo_pis = {str(p).strip() for p in (u.get("pseudo_pi") or [])}
     keep, dropped = [], []
     for c in u.get("clock_signals") or []:
         port = (c.get("port") or "").strip()
         if not port:
-            continue
-        if port in pseudo_pis:
-            keep.append(c)              # 伪主输入：内部路径，必须保留
-            continue
-        # 【兜底】层级路径（含 "/"）一律保留，不按"非端口"剔除。
-        # 为什么要这条：那 9 条时钟本应由 pseudo_pi 名单保护，但 pseudo_pi 来自
-        # `_apply_pseudo_pi(u, facts)` 的浮动时钟根分析 —— 大网表上这一步可能算不出
-        # （测试10/task_1/case5 就是 pseudo_pi 为空），于是同一批时钟被当"非端口"
-        # 全删，9 个时钟域不可控 → DFTR1×69022，整轮 89656 违例。
-        # 而裸名字（如 task2/case6 的 GCLK，ICG 输出引脚）没有 "/"，仍然会被剔除，
-        # 不会重现 SCAN-1315。层级路径作 -port 是工具接受的（测试8 同 case DRC 0）。
-        if "/" in port:
-            keep.append(c)
             continue
         # 端口表可能带位宽（如 cfg_o[13:0]），统一取基名比较
         base = {p.split("[")[0] for p in ports}
@@ -3765,253 +2519,18 @@ def _drop_non_port_clocks(u, facts):
             "set_scan_signal -port）：" + "、".join(dropped))
 
 
-def _merge_signal_entries(llm_list, rule_list):
-    """
-    按端口名合并「信号声明」列表：LLM 的取值优先，规则补 LLM 没写的**子字段**。
-
-    为什么不能整块二选一（2026-10-28 t1/case5 实测）：
-    LLM 从任务书只能读出「顶层时钟 pll_core_cpuclk」，而规则沿网表时钟树算出
-    它下面挂着 9 条内部时钟（associated_internal_clocks）。整块取 LLM 的，
-    这 9 条就永远丢了 —— 渲染出来的 dofile 比 golden 少一大段，而且丢的
-    正是 DFTR1「时钟不可控」要靠它们消除的那批声明。
-
-    合并粒度：
-      · 同一个 port：LLM 的每个键优先，规则只补 LLM 没写的键；
-      · **例外 `usage`**：规则优先。原因是规则从「确保…ICG 保持导通」
-        「控制 shift/capture 切换」这类精确句式抽取，判定的是**该端口物理上
-        接在哪儿**（ICG 的 TE 引脚 vs 链使能），属于确定性事实；
-        而模型有明显「一律 all」的惯性（实测 case5 两个使能都被写成 all，
-        golden 是 clock_gating / scan 各自独立）。
-      · 只在规则里出现的 port：**保留**（它是从网表/任务书表格确定性抽出来的，
-        LLM 漏读不代表它不该配）。这一条对 hidden case 尤其重要 ——
-        任务书表格一大，模型漏行是常态。
-    """
-    if not llm_list and not rule_list:
-        return llm_list or rule_list
-    out, seen = [], set()
-    rule_by_port = {}
-    for item in rule_list or []:
-        if isinstance(item, dict):
-            p = str(item.get("port") or "").strip()
-            if p:
-                rule_by_port[p] = item
-    for item in llm_list or []:
-        if not isinstance(item, dict):
-            continue
-        p = str(item.get("port") or "").strip()
-        merged = dict(item)
-        r = rule_by_port.get(p)
-        if r:
-            for k, v in r.items():
-                if merged.get(k) in (None, "", [], {}):
-                    merged[k] = v
-            # usage：**只有规则拿到「物理事实」时才压过模型**。
-            #
-            # ★ 2026-11-01 改造（第五轮报告第 2 条的直接原因）：旧实现无条件
-            #   `merged["usage"] = r["usage"]`，于是模型即便读懂了「这条使能要覆盖
-            #   扫描单元与时钟门控」，只要规则没抽到，它的判断就被规则的空值顶掉。
-            #   现在分两种：
-            #     · 规则给出 clock_gating —— 这是「该端口接在 ICG 的 TE 上」的物理
-            #       事实（源自「确保…ICG 保持导通」这类句式），规则胜；
-            #     · 其余情况 —— 模型给了合法值就用模型的，规则只在模型没给时兜底。
-            _r_usage = normalize_usage(r.get("usage"))
-            _l_usage = normalize_usage(merged.get("usage"))
-            if _r_usage == "clock_gating":
-                merged["usage"] = "clock_gating"
-            elif _l_usage:
-                merged["usage"] = _l_usage
-            elif _r_usage:
-                merged["usage"] = _r_usage
-        out.append(merged)
-        seen.add(p)
-    for item in rule_list or []:
-        if not isinstance(item, dict):
-            continue
-        p = str(item.get("port") or "").strip()
-        if p and p not in seen:
-            out.append(dict(item))
-            seen.add(p)
-    return out
-
-
-def merge_understanding(base, fallback):
-    """
-    合并「LLM 理解」与「规则抽取」：**按字段性质分工**，不是统一谁优先。
-
-    Args:
-        base: LLM 从任务书抽出的结构化理解（语义判断）。
-        fallback: rule_understanding 的确定性抽取（事实计算）。
-
-    分工原则（2026-10-28，按实测错误归因确定）：
-
-      · **语义型字段 → LLM 优先**：这句话是描述还是配置要求、单时钟域怎么配、
-        lockup 落在跨域边界还是链尾、哪个端口是扫描使能。规则读不懂这些。
-
-      · **事实型字段 → 规则优先，LLM 不得覆盖**：
-        - `scan_cell_mappings`：DFF→SFF 映射由**库单元命名规律 + 网表实例**决定，
-          规则逐条比对得出；模型倾向于按"SFF 通常叫 xxx"的先验补一批，
-          实测 t1/case4 golden 一对都没有，模型硬推了 5 对 → 结构性错误。
-        - `usage`：见 _merge_signal_entries（端口接在 ICG 的 TE 还是链使能，
-          是从"确保…ICG 保持导通"这类句式精确定位出来的物理事实）。
-        - `chain_count` / `max_length`：任务书逐字给出的数字，见 apply_plan。
-
-      · 其余信号列表按端口合并（LLM 取值优先、规则补子字段与漏项），
-        因为"某个内部时钟挂在哪"是网表算出来的事实，不能丢。
-    """
-    if not base:
-        return dict(fallback or {})
-    out = dict(base)
-    out["_source"] = "llm"          # 供 generate_from_config 区分来源
-    fb = fallback or {}
-    _SIGNAL_KEYS = ("clock_signals", "reset_signals",
-                    "scan_enable_signals", "constant_signals")
-    for k, v in fb.items():
-        if k in _SIGNAL_KEYS or k in ("scan_cfg", "scan_cell_mappings", "wrapper_cfg"):
-            continue                     # 下面按各自粒度处理
-        if out.get(k) in (None, "", [], {}):
-            out[k] = v
-
-    # wrapper_cfg：LLM 理解也会吐一份，而且往往只有 enabled / 两个阈值
-    # （t1/case6 实测：LLM 侧 {enabled, reuse_threshold, depth_threshold,
-    # dedicated_cell}，规则侧的 style / max_length / key1→none / key2→dedicated
-    # 全被「LLM 有值就整体保留」顶掉）。按项合并，规则值打底、LLM 只补它明确给的键。
-    _fb_w = fb.get("wrapper_cfg") or {}
-    if _fb_w:
-        out["wrapper_cfg"] = _merge_wrapper_cfg(_fb_w, out.get("wrapper_cfg") or {})
-
-    # 规则能**逐字解析**的两类字段，不能被 LLM 的缺失/空值顶掉。
-    #
-    # 依据（2026-10-31 十个新 case 实测）：merge_understanding 把
-    # `scan_cell_mappings` / `scan_cfg` 从通用补空里排除（"下面按各自粒度处理"），
-    # 但下面**根本没有**处理它们 —— 结果是规则从表格里精确抽到的
-    # 4 对 DFF→SFF 映射、DFTR-TIE0/TIE1 豁免全都丢了，只剩模型给的那份（常常是空）。
-    # 这两类都是"表里写死的字面值"，规则比模型可靠，与 docstring 的
-    # "事实型字段 → 规则优先" 也一致。
-    _fb_maps = fb.get("scan_cell_mappings") or []
-    if _fb_maps:
-        out["scan_cell_mappings"] = [list(p) for p in _fb_maps]
-    _fb_drc = fb.get("drc_rules") or []
-    if _fb_drc:
-        _lst = list(out.get("drc_rules") or [])
-        for _v in _fb_drc:
-            if _v not in _lst:
-                _lst.append(_v)
-        out["drc_rules"] = _lst
-
-    # 扫描元素排除 / 例外模式：并集。
-    # 依据（2026-10-30，t1/case3）：LLM 理解给出的 exclude 是 `X/*` 这种通配写法，
-    # 规则侧从原文精确抽到的是 `X` 与它的例外 `X/mintthresh*`；只留 LLM 那份会
-    # 把准确路径换成通配，工具匹配范围变大（golden 用的是原样路径）。
-    for _k in ("scan_element_exclude", "scan_element_include"):
-        _lst = list(out.get(_k) or [])
-        for _v in fb.get(_k) or []:
-            if _v not in _lst:
-                _lst.append(_v)
-        if _lst:
-            out[_k] = _lst
-
-    for k in _SIGNAL_KEYS:
-        if k in fb or k in out:
-            out[k] = _merge_signal_entries(out.get(k), fb.get(k))
-
-    # 记下「规则侧给出过 off_state 的端口」。后续 sanitize_off_state_by_spec
-    # 需要区分「这个 off_state 是规则按句式推出来的（有据）」还是
-    # 「模型凭先验补的（无据，要删）」—— 这里留痕，避免重复跑规则抽取。
-    _rule_off = {}
-    for k in _SIGNAL_KEYS:
-        for item in fb.get(k) or []:
-            if isinstance(item, dict) and item.get("off_state") is not None:
-                p = str(item.get("port") or "").strip()
-                if p:
-                    _rule_off[p] = item["off_state"]
-    if _rule_off:
-        out["_rule_off_state"] = _rule_off
-
-    # 同理记录「规则侧给出过 constant 的端口」，供 sanitize_constant_by_spec
-    # 区分「规则按句式抽的（有据）」与「模型凭常识补的（要删）」。
-    _rule_const = [str(it.get("port") or "").strip()
-                   for it in (fb.get("constant_signals") or [])
-                   if isinstance(it, dict) and str(it.get("port") or "").strip()]
-    if _rule_const:
-        out["_rule_constant_ports"] = _rule_const
-
-    # scan_cfg 按选项键补空（整块比较会把规则推出的 lockup 落点丢掉，
-    # 2026-10-28 t1/case6 实测：golden 有 -insert_terminal_lockup true，渲染不出来）。
-    fb_cfg = fb.get("scan_cfg")
-    if isinstance(fb_cfg, dict) and fb_cfg:
-        cfg = dict(out.get("scan_cfg") or {})
-        for k, v in fb_cfg.items():
-            if cfg.get(k) in (None, "", [], {}):
-                cfg[k] = v
-        # chain_count / max_length：题面**逐字给出的数字**，规则是按句式匹配出来的，
-        # 比模型可靠（模型会把「不超过 4 条」直接填 4、把分区链数加起来当总数）。
-        # 只在规则确实解析到数字时覆盖，解析不到仍用模型的。
-        for _k in ("chain_count", "max_length"):
-            if fb_cfg.get(_k) not in (None, "", 0, []):
-                cfg[_k] = fb_cfg[_k]
-        out["scan_cfg"] = cfg
-
-    # scan_cell_mappings：**规则为准**。
-    # 规则是拿库单元命名规律逐条比对出来的（dfrtp_1 → sdfrtp_1），
-    # 模型则是按"SFF 一般长什么样"的先验补，实测 case4 多推了 5 对、
-    # 而 golden 一对都没有 —— 这类多出来的映射会让工具去替换本不该动的单元。
-    # 只有规则完全没算出来、且任务书明确给了对照表时，才采纳模型的。
-    # scan_cell_mappings：规则算出来的全收；模型**独有**的项要过两道闸。
-    #
-    # ★ 2026-11-01 改造。旧实现是「规则有就只要规则的」，于是题面若用
-    #   「dfxtp_1 换成 sdfxtp_1」这种说法（规则的正则只认 `a → b` / 表格行），
-    #   模型抽到的映射会被整份丢掉 —— 修复类 case 里「缺映射」就补不回来。
-    #   但反过来全信模型也不行（t1/case4 实测：golden 一对都没有，模型硬推 5 对）。
-    #   所以：
-    #     闸 1 —— 目标必须是库中真实存在的扫描触发器（库单元清单来自 .lib）；
-    #     闸 2 —— 题面确实要求映射（规则解析到对照表/要求句），或者规则一对都没算出来。
-    fb_maps = [list(p) for p in (fb.get("scan_cell_mappings") or [])]
-    llm_maps = [list(p) for p in (out.get("scan_cell_mappings") or [])
-                if isinstance(p, (list, tuple)) and len(p) >= 2]
-    _lib = set(fb.get("lib_cells") or [])
-
-    def _map_ok(pair):
-        d, sff = str(pair[0] or ""), str(pair[1] or "")
-        if not re.search(r"(df|edf)", d, re.I):
-            return False
-        if not re.search(r"s(df|edf)", sff, re.I):
-            return False
-        return (not _lib) or (sff in _lib)
-
-    # 闸 2 只认「题面确实要求映射」。**不能**写成「规则没算出来就放行」——
-    # t1/case4 的题面没有映射表，规则一对都算不出来，而模型凭先验硬推了 5 对，
-    # 而 golden 一对都没有（多写的映射会让工具去替换本不该动的单元）。
-    _spec_wants = bool(fb.get("_spec_requires_cell_mapping"))
-    merged_maps, _seen = [], set()
-    for _src in (fb_maps, llm_maps if _spec_wants else []):
-        for _pair in _src:
-            if not _map_ok(_pair):
-                continue
-            _key = (str(_pair[0]), str(_pair[1]))
-            if _key in _seen:
-                continue
-            _seen.add(_key)
-            merged_maps.append([_key[0], _key[1]])
-    if merged_maps:
-        out["scan_cell_mappings"] = merged_maps
-    elif not fb_maps and not _spec_wants:
-        out["scan_cell_mappings"] = []
-    return out
-
-
 def rule_understanding(task, facts=None):
     """
     规则化结构化抽取（公开接口）：0.00s 完成，不占用任何 LLM 调用。
 
-    定位（2026-10-28 修正）：**兜底**，不是主路径。
-    主路径是 LLM 理解（input_parser.extract_task_understanding）——
-    任务书语义解析是赛题的核心考点，规则读不懂「单时钟域所以可以混沿」这类
-    推导，只适合在 LLM 失败或留空字段时补位。
-
-    为什么仍需保留它：
-      · LLM 不可用/超时/返回残缺时，整条链路不能空跑（预运行窗口只有 120s 量级）；
-      · 部分字段（DFF→SFF 映射、输出产物名）以库命名规律与网表实例为依据，
-        确定性计算比模型猜更可靠，用于给 LLM 的结果补空。
+    为什么用它替代 LLM 结构化理解（原 input_parser.extract_task_understanding）：
+      · 实测该 LLM 调用单次 62.9~68.0s，且本地三次全部返回空 / JSON 残缺，
+        对 150s 预算的 case 是纯浪费 —— 它跑完，dftexp_scan 就没时间了；
+      · 本函数的抽取结果与 LLM 版本同量级（DFF→SFF 映射、DFT 信号、ICG 排除、
+        不可扫描模块、输出产物名、网表事实增强均已覆盖）；
+      · 生成阶段（规则模板 / LLM 生成 prompt）都以它为输入，行为与原先
+        「LLM 理解失败时的兜底」完全一致 —— 即把降级路径提升为主路径，
+        抽取质量不变、预运行时间从 ~65s 降到 0.00s。
 
     Args:
         task: parse_task 结果
@@ -4021,28 +2540,7 @@ def rule_understanding(task, facts=None):
     Returns:
         dict: 与 extract_task_understanding 同构的结构化理解
     """
-    u = _rule_extract_understanding(task, facts=facts)
-    # 标记来源：generate_from_config 要据此决定是否跑「删臆造配置」的 sanitize。
-    # 规则抽取的每一条都有句式/网表依据，不该被当成模型臆造删掉。
-    if isinstance(u, dict):
-        u["_source"] = "rule"
-        # 供 merge_understanding 给「模型独有的 DFF→SFF 映射」开闸：
-        #  · lib_cells —— 库单元清单（校验映射目标真实存在）。
-        #    注意 facts["lib_cells"] 是**数量**（int），不是清单；清单得从 .lib 读，
-        #    这里复用 spec_fixer 的读取器，读不到就留空（留空则只做命名规律校验）。
-        try:
-            import spec_fixer as _sf
-            _cells = _sf._lib_cells(str((task or {}).get("input_dir") or ""))
-            if _cells:
-                u["lib_cells"] = sorted({str(c) for c in _cells})
-        except Exception:                                   # noqa: BLE001
-            pass
-        try:
-            u["_spec_requires_cell_mapping"] = bool(
-                spec_requires_cell_mapping((task or {}).get("task_spec", "") or ""))
-        except Exception:                                   # noqa: BLE001
-            u["_spec_requires_cell_mapping"] = False
-    return u
+    return _rule_extract_understanding(task, facts=facts)
 
 
 
@@ -4091,138 +2589,6 @@ _STD_OUT_VAR_RE = re.compile(
     r'^[ \t]*set\s+out_res_dir\s+\[file join \$run_dir "output"\][ \t]*$', re.M)
 
 
-
-def ensure_required_signals(dofile, task, understanding, facts=None):
-    """
-    **任务书要求的扫描信号，dofile 里必须真的声明出来** —— 缺了就补。
-
-    为什么需要（2026-10-27，本地新 case t2_led_drv 实测）：
-    task_2 修的是别人注入过故障的 dofile。注入方式之一是「把
-    `set_scan_signal -type constant -port scan_mode -constant_value 1` 删掉、
-    只在原处留一行注释」。修复逻辑改了时钟 mux、ICG mux，却**没有把这条
-    常量声明补回去** —— dofile 里只有注释，仿真时 scan_mode 是未知态，
-    ECO 的效果根本看不到，DRC 一条不降。
-
-    这不是某个 case 的特例：只要「任务书要求 X、dofile 里没有 X」，
-    结果就一定是错的。所以做成通用规则，按 understanding 里的四类信号逐条核对：
-      clock / reset / scan_enable / constant
-    判定「已声明」的标准是 dofile 里出现 `-port <名字>`（不区分 type，
-    避免同一端口既是 clock 又被写进别的命令时误判）。
-
-    同时做一件相关的事：整份 dofile 里 `-usage scan` 若设计含 ICG，改成 all
-    （DFTR9 的根因，与生成路径同一套判断）。
-
-    Returns:
-        (text, notes)
-    """
-    text = dofile or ""
-    notes = []
-    if not text:
-        return text, notes
-
-    facts = ensure_facts(task, facts)
-    u = understanding or {}
-
-    # 与生成路径**同一口径**：sanitize 删掉的臆造项，不能被这里的"补声明"补回来。
-    #
-    # 实测 t1/case4：模型臆造 `constant pad_yy_test_mode`（任务书通篇没提该端口），
-    # generate_from_config 内部的 sanitize_constant_by_spec 已经删掉，但调用方手里的
-    # understanding 仍是原始版本，本函数照单补写 —— 产物里又出现一条与 golden 冲突的
-    # 常值声明，而且**随 LLM 波动**（有时臆造、有时不臆造）。
-    # 判据与生成路径一致：`_source == "rule"` 的取值本来就逐条有句式依据，跳过。
-    if u.get("_source") != "rule":
-        for _fn in ("sanitize_usage_by_spec", "sanitize_off_state_by_spec",
-                    "sanitize_constant_by_spec"):
-            try:
-                u = globals()[_fn](u, task)
-            except Exception:                                   # noqa: BLE001
-                pass
-
-    def _declared(name):
-        return re.search(r"-port\s+[\"']?" + re.escape(name) + r"\b", text) is not None
-
-    want = []                      # (port, 命令行, 说明)
-    # 「不建链」的脚本不声明扫描时钟 / 复位：这两类声明的用途是给插链划分时钟域
-    # 与复位域，前置处理阶段（只有 -connect_icg_only / -replace_only /
-    # -replace_unscan）根本用不上。golden 佐证：task_1/case1、case4 是前置处理型，
-    # 两份都 **0 条** `-type clock`；其余 9 份建链型全都声明了时钟。
-    # 旧实现一视同仁地补，给 case1 凭空加了 pll_core_cpuclk / pad_had_jtg_tclk
-    # 两条时钟声明，与 golden 直接差出 2 项。scan_enable / constant 不受影响
-    # —— ICG 重连与功能模式锁定在前置处理阶段就要生效。
-    _builds = dofile_builds_chain(text) is not False
-    for c in (u.get("clock_signals") or []) if _builds else []:
-        p = str(c.get("port") or "").strip()
-        if p:
-            cmd = f"set_scan_signal -type clock -port {p}"
-            if c.get("off_state") is not None:
-                cmd += f" -off_state {c['off_state']}"
-            want.append((p, cmd, "扫描时钟"))
-    for r in (u.get("reset_signals") or []) if _builds else []:
-        p = str(r.get("port") or "").strip()
-        if p and r.get("role", "scan_reset") != "described_only":
-            cmd = f"set_scan_signal -type reset -port {p}"
-            if r.get("off_state") is not None:
-                cmd += f" -off_state {r['off_state']}"
-            want.append((p, cmd, "复位信号"))
-    _se_all = [x for x in (u.get("scan_enable_signals") or [])
-               if str(x.get("port") or "").strip()]
-    _se_spec = (task or {}).get("task_spec", "") or ""
-    for s in _se_all:
-        p = str(s.get("port") or "").strip()
-        if p and s.get("role", "scan_enable") != "described_only":
-            usage = normalize_usage(s.get("usage"))
-            if usage == "scan":
-                # 与 generate_from_config 同一判据（见 _resolve_se_usage）：
-                # 不能因为「设计里有 ICG」就把 scan 升成 all，也不能无脑写 scan。
-                usage = _resolve_se_usage(s, _se_all, _se_spec, facts)
-            cmd = f"set_scan_signal -type scan_enable -port {p}"
-            # off_state 必须跟着写：题面写「off_state = 0」就是要求显式声明，
-            # 漏掉它等于把语义交给工具默认值（public/t1/case3 实测：golden 是
-            # `-off_state 0`，我们只写 `-usage scan`）。
-            if s.get("off_state") in (0, 1):
-                cmd += f" -off_state {s['off_state']}"
-            if usage:
-                cmd += f" -usage {usage}"
-            want.append((p, cmd, "扫描使能"))
-    for c in u.get("constant_signals") or []:
-        p = str(c.get("port") or "").strip()
-        if p:
-            want.append((p, f"set_scan_signal -type constant -port {p} "
-                            f"-constant_value {c.get('value', 1)}", "常值信号"))
-
-    missing = [(p, cmd, why) for p, cmd, why in want if not _declared(p)]
-    if missing:
-        lines = text.splitlines()
-        # 插在第一条 insert_dft_logic 之前（配置段末尾）；没有就插在 exit 之前
-        idx = next((i for i, ln in enumerate(lines)
-                    if re.match(r"\s*insert_dft_logic\b", ln)), None)
-        if idx is None:
-            idx = next((i for i, ln in enumerate(lines)
-                        if ln.strip().lower() == "exit"), len(lines))
-        block = ["# ── 补齐任务书要求但原 dofile 缺失的扫描信号 ─────────"] + \
-                [cmd for _p, cmd, _w in missing]
-        lines[idx:idx] = block
-        text = "\n".join(lines) + ("\n" if text.endswith("\n") else "")
-        for p, _cmd, why in missing:
-            notes.append(f"补声明{why} {p}")
-
-    # 有 ICG 时把 -usage scan 提升为 all（与生成路径一致）
-    #
-    # **例外**：若另一条 scan_enable 已经带 `-usage clock_gating`，说明设计给出了
-    # 专用于 ICG 的使能端口，这条 scan 端口就该保持 scan —— 两条都覆盖门控与
-    # 参考写法冲突，且掩盖了「ICG 使能与扫描使能分离」这一设计事实。
-    # 佐证：task_1/case5 golden 同时声明
-    #   `pad_yy_scan_enable -usage scan` 与 `pad_yy_icg_scan_en -usage clock_gating -off_state 1`。
-    _has_gating_port = re.search(
-        r"(?m)^[ \t]*set_scan_signal\b[^\n]*-usage\s+clock_gating", text)
-    if _has_icg_cells(facts) and not _has_gating_port:
-        new_text = re.sub(r"(-usage\s+)scan\b", r"\1all", text)
-        if new_text != text:
-            notes.append("含 ICG：-usage scan → all")
-            text = new_text
-
-    return text, notes
-
 def ensure_output_vars(dofile_text):
     """
     确保 dofile 中输出目录变量已正确定义。
@@ -4262,725 +2628,6 @@ def ensure_output_vars(dofile_text):
     return "\n".join(header) + body
 
 
-
-def _ports_required_but_absent(task, understanding, facts):
-    """
-    找出「任务书要求新建、但网表里还不存在」的端口。
-
-    为什么需要（task_2/picorv32 实测）：任务书写「新建端口 test_se」，只生成
-    `set_scan_signal -type scan_enable -port test_se` 会报
-    `[SCAN-4610] Port 'test_se' does not exist in the design`，后面整条链都跑不动，
-    DRC 永远清不了。
-
-    判定（三条同时满足，宁可不补也不要乱补）：
-      1. 该端口被计划/理解用作 clock / scan_enable / reset / constant；
-      2. 网表顶层端口清单里**没有**它；
-      3. task_spec 原文**点名**了它（说明是要求新建，不是模型幻觉）。
-    """
-    ports = (facts or {}).get("top_ports") or {}
-    if not ports:
-        return []
-    spec = (task or {}).get("task_spec", "") or ""
-    # 任务书说「由工具自动创建端口」时一律不补：public/task_1/case2 就是这么写的，
-    # 官方 golden 里也没有 add_port（工具对缺失端口只给 WARNING，不中断）。
-    if re.search(r"自动创建[^\n]{0,12}端口|端口[^\n]{0,12}自动创建", spec):
-        return []
-    # 每域独立 SE 的情形：端口由我们自己命名，没有"题面点名"可依
-    _per_domain_se = bool(re.search(
-        r"(?:每(?:个|一)(?:分区|时钟域|域)|分别)[^\n]{0,24}"
-        r"(?:独立|单独)[^\n]{0,12}(?:扫描使能|scan\s*enable|SE)", spec, re.I))
-    _part_se = {str(p.get("se") or "")
-                for p in (understanding or {}).get("partitions") or [] if p.get("se")}
-    out = []
-    for key in ("clock_signals", "scan_enable_signals", "reset_signals",
-                "constant_signals"):
-        for item in (understanding or {}).get(key) or []:
-            name = str(item.get("port") or "").strip()
-            if not name or name in ports or name in out:
-                continue
-            # 只有任务书**明确要求新建**这个端口才补（「新建端口 test_se」这类）。
-            # 仅仅"提到过这个名字"不算 —— 那多半是工具会自动创建的 DFT 端口。
-            explicit = re.search(
-                r"(?:新建|新增|创建)\s*(?:一个)?\s*端口\s*[`\"'\s]*" + re.escape(name)
-                + r"|" + re.escape(name) + r"[`\"'\s]{0,4}(?:端口)?[^\n]{0,8}?(?:需|须|要)?(?:新建|新增)",
-                spec)
-            if explicit:
-                out.append(name)
-            elif _per_domain_se and name in _part_se:
-                # 题面要求「每域独立扫描使能」且**端口名自拟**：这些 se_* 是我们
-                # 按分区时钟 token 造出来的，不是模型幻觉，必须 add_port 创建，
-                # 否则 `set_scan_signal -port se_wb` 会报 SCAN-4610 端口不存在。
-                out.append(name)
-    return out
-
-
-def _has_icg_cells(facts):
-    """网表里是否存在时钟门控单元（ICG）—— 决定 -usage 能不能用 scan。"""
-    f = facts or {}
-    icg = f.get("icg") or {}
-    if icg.get("cells") or icg.get("floating_clk") or icg.get("floating_clock_roots"):
-        return True
-    # 兜底：按单元名判断（各工艺库的 ICG 命名都含这几个词根）
-    for name in (f.get("all_types") or f.get("ff_types") or {}):
-        low = str(name).lower()
-        if ("icg" in low or "clkgat" in low or "sdlclkp" in low
-                or "dlclkp" in low or "clock_gat" in low):
-            return True
-    return False
-
-def sanitize_usage_by_spec(understanding, task):
-    """
-    按任务书依据裁剪 scan_enable 的 `usage`：**没依据就不写**。
-
-    为什么需要这一步（2026-10-28 实测 t1/case3、case5）：
-    模型对 `-usage` 有很强的「有 ICG 就填 all」先验，即使 prompt 明说默认不写，
-    它仍然填 all；而 golden 是 case3 不写、case5 按端口分别给 clock_gating / scan。
-    多一个 -usage 会改变工具行为，不属于「写法差异」，必须裁掉。
-
-    裁剪原则（与 off_state 同一套「有据才写」）：
-      · 已有明确取值（scan / clock_gating）→ **不改**。这类值来自规则对精确
-        句式的抽取（"确保…ICG 保持导通" → clock_gating），是物理接线事实；
-      · usage == all → 检查依据：只有单一用途就降级成那个用途
-        （模型的一律 all 会显著改变工具行为，不该无据保留）；
-      · usage 缺失 → 不补（工具默认）。
-    """
-    u = understanding or {}
-    lst = u.get("scan_enable_signals")
-    if not isinstance(lst, list):
-        return understanding
-    spec = (task or {}).get("task_spec", "") or ""
-    notes = []
-    out = []
-    for item in lst:
-        if not isinstance(item, dict):
-            out.append(item)
-            continue
-        item = dict(item)
-        port = str(item.get("port") or "")
-        usage = item.get("usage")
-        if usage in ("scan", "clock_gating"):
-            out.append(item)          # 明确取值，信任它
-            continue
-        if usage != "all":
-            out.append(item)
-            continue
-        near = ""
-        if port:
-            m = re.search(re.escape(port) + r"[^\n]{0,60}", spec)
-            if m:
-                near = m.group(0)
-        gating = bool(re.search(r"ICG|门控|clock\s*gating|clock_gating", near, re.I))
-        scanning = bool(re.search(r"扫描|shift|capture", near, re.I))
-        if gating and scanning:
-            item["usage"] = "all"          # 两种用途都提到 → all 成立
-        elif gating:
-            item["usage"] = "clock_gating"
-            notes.append(f"{port}: usage all → clock_gating（任务书只提门控）")
-        elif scanning:
-            item["usage"] = "scan"
-            notes.append(f"{port}: usage all → scan（任务书只提扫描）")
-        else:
-            item.pop("usage", None)
-            notes.append(f"{port}: 任务书未提用途，删除 -usage")
-        out.append(item)
-    if notes:
-        u = dict(u)
-        u["scan_enable_signals"] = out
-        u.setdefault("notes", []).extend(notes)
-    return u
-
-
-def spec_requires_cell_mapping(spec):
-    """
-    任务书是否**明确要求**声明 DFF→SFF 映射（而不是只在说明表里列了单元名）。
-
-    为什么不能只看"表里有一对单元名"（2026-10-31）：
-      · public/task_1/case2 的「时序单元」表末尾有一列 `sdfxtp_1`，但那是**说明**
-        （单元/描述/数量/会被替换成什么），golden **不写** set_scan_cell_mapping；
-      · 新 case 的 t1/case2 表头写的是「扫描映射」，正文还单列一条要求
-        「指定四类 DFF→SFF 映射」，golden **写** 4 对。
-    两份题面都"有表"，差别就在**有没有把映射写成要求**。判据落在这里才不会二选一错。
-
-    两个信号任一成立即算要求：
-      · 表头含「扫描映射」（`| 单元 | 数量 | 扫描映射 |`）；
-      · 出现「映射」的要求句（带 指定/声明/给出/配置/完成 这类动词）。
-    """
-    spec = spec or ""
-    for line in spec.splitlines():
-        if "扫描映射" in line and line.strip().startswith("|"):
-            return True
-        if "映射" in line and re.search(r"(指定|声明|给出|配置|完成|建立)", line):
-            return True
-    return False
-
-
-def sanitize_mappings_by_facts(understanding, facts, task=None):
-    """
-    DFF→SFF 映射校验：**任务书给了配对关系才映射**。
-
-    为什么不能用网表判断（2026-10-28 实测，这条踩过坑）：
-    t1/case1 与 t1/case4 的网表 SFF 清单**完全一样**
-    （sdfstp_2 / sdfrtp_1 / sdlclkp_1），但 golden 一个要 4 对映射、一个一对都不要。
-    差别只在任务书：
-      · case1 第 63 行给了配对表 `| dfrtp_1 | sdfrtp_1 | 异步复位 DFF |`
-      · case4 通篇没有出现任何 DFF/SFF 单元名
-    所以判据必须落在**任务书有没有给出配对关系**上 —— 这也正是工具需要的：
-    给了就按表替换，没给就让它自己按库推断。
-
-    判定：任务书里存在「同一行出现 ≥2 个库单元名」的表格行 → 视为给了配对，
-    保留映射（规则抽取已按该表生成）；否则清空模型臆造的映射。
-    """
-    u = understanding or {}
-    maps = u.get("scan_cell_mappings")
-    if not isinstance(maps, list) or not maps:
-        return understanding
-    spec = (task or {}).get("task_spec", "") or ""
-    if not spec:
-        return understanding
-    # 库单元名形态：xxx__yyy_zzz（Sky130 等标准单元库的双下划线命名）
-    cell_re = re.compile(r"\b[a-z0-9_]+__[a-z0-9_]+\b")
-    # 先看**规则解析器**能不能从表里抽出配对：抽到了就说明任务书确实给了配对关系。
-    # 旧的启发式要求同一行出现 ≥2 个带 `__` 的库单元名，可是新 case 的映射表写的是
-    #   | `sky130_fd_sc_hd__dfxtp_1` | 9,305 | `sdfxtp_1` |
-    # SFF 是短名（没有 `__`），于是判定"没给配对"→ 把 4 对全清空
-    # （2026-10-31 十个新 case 实测：t1/c2、t1/c5、t2/c1、t2/c3 的映射全丢）。
-    # 判据：表头写「扫描映射」，或正文把映射写成一条要求（"指定四类 DFF→SFF 映射"）。
-    # 只看"同一行有两个带 __ 的单元名"不够 —— 说明性表格（public/c2 的「扫描单元」列）
-    # 也会命中，而那份 golden 明确不写映射。
-    if spec_requires_cell_mapping(spec) and _cell_mappings_from_spec(spec):
-        return understanding
-    paired = False
-    for line in spec.splitlines():
-        if len(set(cell_re.findall(line))) >= 2:
-            paired = True
-            break
-    if paired:
-        return understanding
-    u = dict(u)
-    u["scan_cell_mappings"] = []
-    u.setdefault("notes", []).append(
-        f"任务书未给 DFF→SFF 配对关系，不需要映射，已清空 {len(maps)} 对")
-    return u
-
-
-def sanitize_constant_by_spec(understanding, task):
-    """
-    `constant_signals` 裁剪：任务书没要求固定电平就删掉。
-
-    为什么（2026-10-28 t1/case4 实测）：
-    模型看到 `pad_yy_test_mode` 这类端口名，会按「测试模式要拉 0」的常识
-    主动补一条常值配置；而任务书通篇没提 test_mode，golden 里也没有。
-    多出来的 `set_scan_signal -type constant` 会让工具去驱动一个本不该被
-    扫描逻辑接管的端口。
-
-    判定：只有任务书在**该端口附近**明确要求固定电平才保留 ——
-    「固定为 0/1」「恒定为」「拉低/拉高」「tie 0/1」「保持 0/1」。
-    这是可泛化的：换任何设计，没要求就不该动它的电平。
-    """
-    u = understanding or {}
-    lst = u.get("constant_signals")
-    if not isinstance(lst, list) or not lst:
-        return understanding
-    spec = (task or {}).get("task_spec", "") or ""
-    if not spec:
-        return understanding
-    # 规则侧给出的 constant 视为「有据」（规则只从"固定为 0/拉低/tie"这类
-    # 精确句式抽取，见 _rule_extract_understanding 的 constant 分支）。
-    # 这里只负责删掉**模型额外臆造**的那些。
-    rule_const = set(u.get("_rule_constant_ports") or [])
-    keep, dropped = [], []
-    for item in lst:
-        if not isinstance(item, dict):
-            keep.append(item)
-            continue
-        port = str(item.get("port") or "")
-        if port in rule_const:
-            keep.append(item)
-            continue
-        near = ""
-        if port:
-            lines = [l for l in spec.splitlines() if port in l]
-            near = "\n".join(lines)
-        if re.search(r"(固定|恒定|保持|拉[低高]|tie[d]?|constant)[^\n]{0,16}[01]"
-                     r"|[01][^\n]{0,10}(固定|恒定)", near, re.I):
-            keep.append(item)
-        else:
-            dropped.append(port)
-    if dropped:
-        u = dict(u)
-        u["constant_signals"] = keep
-        u.setdefault("notes", []).append(
-            "任务书未要求固定电平，已删除 constant：" + "、".join(p for p in dropped if p))
-    return u
-
-
-def sanitize_off_state_by_spec(understanding, task):
-    """
-    `off_state` 裁剪：**没有明确依据就删掉，绝不主动补**。
-
-    为什么要裁（2026-10-28 t1/case2 实测）：
-    模型会凭"复位通常低有效"的先验补 `off_state`，有时方向还反了。
-    `-off_state` 决定扫描态下该信号被驱到哪个电平，写反会让复位在扫描时
-    被错误释放 —— 这是功能性错误，不是风格差异。
-
-    【为什么只删不补】（这条决定了它在 hidden case 上是否安全）
-    最终评测是全新 case、没有 golden。任何"按端口名猜电平""按 public case
-    的习惯补参数"都属于过拟合，换个设计就错。唯一可泛化的做法是：
-      · 任务书**逐字写了**关闭电平（`_explicit_off_state` 能从原文抽到）
-        → 这是确凿依据，保留（模型若写反了，这里会按依据改写）；
-      · 任务书没写 → 删除该键。手册里 `-off_state` 本身就是可选项，
-        不写等于让工具用默认行为 —— 这是 hidden case 上唯一不会错的选择。
-    注意：**不按端口名推断**（`_b` 结尾未必低有效，也可能是名字巧合）。
-    """
-    u = understanding or {}
-    spec = (task or {}).get("task_spec", "") or ""
-    if not spec:
-        return understanding
-    rule_off = u.get("_rule_off_state") or {}
-    changed = False
-    out = dict(u)
-    for key in ("clock_signals", "reset_signals", "scan_enable_signals"):
-        lst = u.get(key)
-        if not isinstance(lst, list):
-            continue
-        new_list = []
-        for item in lst:
-            if not isinstance(item, dict):
-                new_list.append(item)
-                continue
-            item = dict(item)
-            port = str(item.get("port") or "")
-            explicit = _explicit_off_state(spec, port)
-            if explicit is not None:
-                # 有原文依据：以原文为准（同时纠正方向写反的情况）
-                if item.get("off_state") != explicit:
-                    item["off_state"] = explicit
-                    changed = True
-            elif port in rule_off:
-                # 规则按句式推出来的（如"确保…ICG 保持导通" → TE 低有效 → 1），
-                # 属于有据：保留规则的取值。
-                if item.get("off_state") != rule_off[port]:
-                    item["off_state"] = rule_off[port]
-                    changed = True
-            elif key == "reset_signals" and _port_implies_active_low(port):
-                # 复位端口按 Low-Active 命名约定（_b / _n / _bar 结尾）→ 关闭电平 1。
-                #
-                # 【为什么这是可泛化知识，不是模仿 golden】
-                # -off_state 的语义是"扫描态下把该信号驱到哪个电平"。复位若低有效
-                # 而这里按默认 0 处理，扫描移位期间复位就被释放了，链上的 FF 会被
-                # 功能复位冲掉 —— 这是设计层面的功能性错误，与参考实现怎么写无关。
-                # 因此凡是低有效复位都必须显式给 1，hidden case 同样适用。
-                #
-                # 【为什么是"强制"而不是"填空"】（2026-10-31 新 case 实测）
-                # 旧写法只在 `off_state` 为空时才补 1。模型经常先填一个 0，
-                # 于是这条规则形同虚设：t1/c4 的四个 `*_rst_b` 全被写成 0，
-                # 等于把整个设计钉在复位态（DRC 直接爆几万条）。
-                # 这是功能不变量，模型的取值必须被纠正，而不是被尊重。
-                if item.get("off_state") != 1:
-                    if item.get("off_state") not in (None, ""):
-                        print(f"  ⚠ 复位 {port} 低有效，扫描态 off_state "
-                              f"{item['off_state']} -> 1（不释放复位就全片停在复位态）")
-                    item["off_state"] = 1
-                    changed = True
-            elif "off_state" in item:
-                # 无依据（且不属于低有效复位）：删掉，交给工具默认
-                item.pop("off_state", None)
-                changed = True
-            new_list.append(item)
-        out[key] = new_list
-    return out if changed else understanding
-
-
-def _port_implies_active_low(port):
-    """
-    端口名是否按通用约定表示低有效（`_b` / `_n` / `_bar` / `_l` 结尾）。
-
-    这是行业通用的命名约定（bash/bus 语境下的 active-low 后缀），
-    DFT 工具链本身也按此推断电平极性，所以可以跨设计使用。
-    只用于**复位**的 off_state 推断 —— 时钟/使能没有这个约定。
-
-    `_ni` 是 CMOS 库里最常见的"低有效输入"写法（rst_ni / reset_ni），
-    2026-10-31 新 case 的 t1/c5 就是 `rst_ni`，旧正则漏了它 → off_state 被删。
-    """
-    p = (port or "").lower()
-    return bool(re.search(r"(_b|_n|_ni|_bar|_l|_low)$", p)) and len(p) > 2
-
-
-def sanitize_lockup_by_spec(understanding, task):
-    """
-    任务书没提 lockup 时，删掉 `add_lockup` / `insert_terminal_lockup`。
-
-    模型有很强的"插链就该有 lockup"的先验，会把这两个键凭常识填上 true；
-    但 public 6 个 case 的 golden 里**只有任务书写了"插入 lockup latch"的
-    case2/case6 才有这两个参数**，case1/3/4/5 一个都没有（实测模型在 case3、
-    case5 各多写一个 add_lockup=true，直接造成与 golden 的 cfg 差异）。
-
-    与 usage/off_state/constant 同一条原则：**有据才写，无据不写**。
-    """
-    if not isinstance(understanding, dict):
-        return understanding
-    cfg = understanding.get("scan_cfg")
-    if not isinstance(cfg, dict) or not cfg:
-        return understanding
-    spec = (task or {}).get("task_spec", "") or ""
-    if re.search(r"lockup", spec, re.I):
-        return understanding
-    if "add_lockup" in cfg or "insert_terminal_lockup" in cfg:
-        cfg.pop("add_lockup", None)
-        cfg.pop("insert_terminal_lockup", None)
-        understanding["scan_cfg"] = cfg
-    return understanding
-
-
-def _apply_lockup_default(understanding, task, facts):
-    """
-    任务书要求"插入 lockup latch"但没说位置时，补 `insert_terminal_lockup`。
-
-    官方答疑（2026-10-29 群答）：「如果任务书没说明 lockup latch 位置的话，
-    默认要求 -add_lockup」，即 `-add_lockup true` 已经是满足要求的写法；
-    `insert_terminal_lockup` 只影响 latch 插在哪（链尾 vs 跨域边界）。
-
-    这里仍会在**单时钟域**设计上补 `insert_terminal_lockup true`，理由不是
-    为了贴近某份 golden，而是手册 2.1.2.4 的结构事实：单域内没有跨域边界，
-    lockup 的唯一落点就是链尾；此时显式声明比交给工具推导更确定。
-    多域（>=2 个真时钟）不补 —— 那时落点由跨域关系决定，交给工具。
-
-    幂等：已经显式给出该键（无论 true/false，含模型判断）时不覆盖。
-    """
-    if not isinstance(understanding, dict):
-        return understanding
-    cfg = understanding.get("scan_cfg")
-    if not isinstance(cfg, dict):
-        return understanding
-    if "insert_terminal_lockup" in cfg or "add_lockup" not in cfg:
-        return understanding
-    if not cfg.get("add_lockup"):
-        return understanding
-    spec = (task or {}).get("task_spec", "") or ""
-    if not re.search(r"lockup", spec, re.I):
-        return understanding
-    # 只有任务书**没指定位置**时才适用；写了"链尾/末端/terminal"说明模型或规则
-    # 已按位置填过，这里不重复干预。
-    if re.search(r"(?:链尾|末端|尾部|terminal)[^\n]{0,8}lockup|lockup[^\n]{0,8}(?:链尾|末端|terminal)",
-                 spec, re.I):
-        return understanding
-    n_dom = max(len((facts or {}).get("clock_ports") or {}),
-                len(understanding.get("clock_signals") or []))
-    if n_dom == 1:
-        cfg["insert_terminal_lockup"] = True
-        understanding["scan_cfg"] = cfg
-    return understanding
-
-
-_ASSOC_PIN_CANDIDATES = ("Q", "QN", "Q_N", "CO", "Z")
-
-
-def _resolve_refs_in_understanding(task, facts, understanding):
-    """
-    把 understanding 里的实例引用回查真实网表：短名补层级路径、假引脚直接删掉。
-
-    两条硬伤都源于「不回查就写出去」：
-
-      1. **短名静默失效**：task_spec 里的对象常写短名（`x_cr_sys_io_pll`），
-         工具按层次路径匹配，匹配不到时 `set_scan_element false` 不报错、
-         回替数为 0 —— 结果网表根本没变，比报错更难发现。
-         实测 t1/case1：我们写短名、golden 写 `x_cr_core_top/x_cr_sys_io_pll`。
-      2. **编造引脚**：拼 `<实例>/Q` 时没查网表，遇到输出脚不叫 Q 的单元
-         （QN / Q_N / lat_q）就是 `SCAN-1620 ... does not exist`，整份 dofile 中断。
-
-    只做「能查到的」修正：网表超出回查上限、或同名实例不唯一时**保持原样**，
-    绝不用猜的替换。
-    """
-    u = understanding if isinstance(understanding, dict) else None
-    if not u:
-        return understanding
-    files = (task or {}).get("files", {}).get("netlist") or []
-    top = (facts or {}).get("top") or (task or {}).get("top_module") or ""
-    if not files or not top:
-        return u
-
-    path_keys = ("scan_element_exclude", "icg_exclude_elements")
-    wanted = set()
-    for key in path_keys:
-        for v in u.get(key) or []:
-            core = str(v).strip().rstrip("*")
-            if core:
-                wanted.add(core)
-                if "/" in core:
-                    wanted.add(core.rsplit("/", 1)[0])
-    inc = [str(v).strip() for v in (u.get("scan_element_include") or []) if str(v).strip()]
-    for v in inc:
-        core = v.rstrip("*")
-        if "/" in core:
-            wanted.add(core.rsplit("/", 1)[0])
-        else:
-            wanted.add(core)
-    assoc = []          # (clock_dict, 原 ref, 实例, 引脚)
-    # 网表事实直接推出来的引脚**不参与校验**：它本来就是从同一张网表里算出来的，
-    # 再拿探测结果去"验"它，只会引入误判（2026-10-31 测试14 的 t1/case5：
-    # 校验误判把这条删掉，DFTR9 直接爆 4215，三轮 1268s 全废）。
-    _trusted_ref = str((facts or {}).get("associated_internal_clocks") or "").strip()
-    for c in u.get("clock_signals") or []:
-        for ref in c.get("associated_internal_clocks") or []:
-            inst, _, pin = str(ref).rpartition("/")
-            if inst and str(ref).strip() != _trusted_ref:
-                wanted.add(inst)
-                assoc.append((c, str(ref), inst, pin))
-    if not wanted:
-        return u
-
-    by_leaf = {}
-    for n in wanted:
-        by_leaf.setdefault(n.rsplit("/", 1)[-1], []).append(n)
-    got = netlist_facts.resolve_instance_refs(files, top, set(by_leaf))
-    # 大网表（>80MB）建不了层级索引 -> got 为空。**但引脚真实性仍然要查**：
-    # 单实例探测只要 mmap + find，259MB 也是 0.2s 级。早先这里直接 return，
-    # 等于"大网表上编造引脚没人管"。
-    def _pick(name):
-        """按名字（短名或路径）取唯一的实例条目；不唯一/找不到返回 None。"""
-        if not got:
-            return None
-        ents = list(got.get(name.rsplit("/", 1)[-1]) or [])
-        if "/" in name:
-            ents = [e for e in ents if e["path"] == name or e["path"].endswith("/" + name)]
-        if len(ents) == 1:
-            return ents[0]
-        if ents:
-            ents.sort(key=lambda e: len(e["path"]))
-            if len(ents[0]["path"]) < len(ents[1]["path"]):
-                return ents[0]      # 明显更短的唯一候选（深层重名的常见形态）
-        return None
-
-    def _fix_path(s):
-        star = "*" if s.endswith("*") else ""
-        core = s.rstrip("*")
-        ent = _pick(core)
-        if ent:
-            return ent["path"] + star
-        if "/" in core:                 # 例外模式 `实例/前缀*`：只补前缀部分
-            head, tail = core.rsplit("/", 1)
-            ent = _pick(head)
-            if ent:
-                return ent["path"] + "/" + tail + star
-        return s
-
-    for key in path_keys:
-        vals = u.get(key)
-        if isinstance(vals, list) and vals:
-            u[key] = [_fix_path(str(v)) for v in vals]
-    if inc:
-        u["scan_element_include"] = [_fix_path(v) for v in inc]
-
-    # 引脚校验：不存在就换成本单元真实存在的输出脚；换不了就整条删掉
-    dropped = []
-    for c, ref, inst, pin in assoc:
-        lst = c.get("associated_internal_clocks") or []
-        ent = _pick(inst)
-        if ent is not None:
-            pins = ent.get("pins") or set()
-            base_path = ent["path"]
-        else:
-            # 大网表没有索引 -> 只探这一个实例（不建层级路径，只验引脚）
-            pins = netlist_facts.probe_instance_pins(files, inst)
-            base_path = inst
-        if not pins:
-            continue                     # 查不到实例 -> 保持原样（可能是网表外的对象）
-        new_ref = None
-        if pin and pin in pins:
-            new_ref = "%s/%s" % (base_path, pin)
-        else:
-            for cand in _ASSOC_PIN_CANDIDATES:
-                if cand in pins:
-                    new_ref = "%s/%s" % (base_path, cand)
-                    break
-            if new_ref is None:
-                q_pins = [p for p in sorted(pins) if p.lower().startswith("q")]
-                if q_pins:
-                    new_ref = "%s/%s" % (base_path, q_pins[0])
-        if new_ref is None:
-            if ref in lst:
-                lst.remove(ref)
-            dropped.append(ref)
-        elif ref in lst:
-            lst[lst.index(ref)] = new_ref
-    if dropped:
-        print(f"  ⚠ 删除网表中不存在的引脚引用：{'、'.join(dropped[:3])}"
-              f"{'…' if len(dropped) > 3 else ''}")
-    return u
-
-
-_REF_SCAN_ELEM_RE = re.compile(
-    r'(set_scan_element\s+(?:true|false)\s+)("([^"]*)"|\{([^}]*)\}|([^\s;]+))')
-_REF_ASSOC_RE = re.compile(
-    r"(-associated_internal_clocks\s+)(\{[^}]*\}|\S+)")
-_REF_EXCLUDE_RE = re.compile(
-    r'(-exclude_elements\s+)("([^"]*)"|\{([^}]*)\}|([^\s;]+))')
-
-
-def fix_instance_refs_in_text(dofile, task, facts=None):
-    """
-    写盘前最后一道：dofile 里的**实例引用**回查网表（路径补全 + 引脚存在性）。
-
-    与 `_resolve_refs_in_understanding` 的分工：那个在 understanding 层做（任务一
-    生成路径），这个在**文本层**做 —— 任务是二走 spec_fixer、修复循环里 LLM 直写
-    的补丁，都不经过 understanding，只能在文本上收口。
-
-    Returns:
-        (新文本, 说明列表)
-    """
-    text = dofile or ""
-    if not text:
-        return text, []
-    files = (task or {}).get("files", {}).get("netlist") or []
-    top = (facts or {}).get("top") or (task or {}).get("top_module") or ""
-    if not files or not top:
-        return text, []
-
-    wanted = set()
-
-    def _core(s):
-        s = (s or "").strip().strip('"').strip("{}").strip()
-        return s.rstrip("*")
-
-    def _add(s):
-        """把待查名字加进集合；带 `/` 的还要加它的前缀（例外模式 `实例/前缀*`）。"""
-        core = _core(s)
-        if not core:
-            return
-        wanted.add(core)
-        if "/" in core:
-            wanted.add(core.rsplit("/", 1)[0])
-
-    for m in _REF_SCAN_ELEM_RE.finditer(text):
-        raw = m.group(3) if m.group(3) is not None else (
-            m.group(4) if m.group(4) is not None else m.group(5))
-        for tok in str(raw or "").split():
-            _add(tok)
-    _trusted_ref = str((facts or {}).get("associated_internal_clocks") or "").strip()
-
-    def _is_trusted(tok):
-        return bool(_trusted_ref) and tok.strip() == _trusted_ref
-
-    for m in _REF_ASSOC_RE.finditer(text):
-        val = m.group(2).strip("{}").strip('"')
-        for tok in val.split():
-            inst, _, _pin = tok.rpartition("/")
-            if inst and not _is_trusted(tok):
-                wanted.add(inst)
-    for m in _REF_EXCLUDE_RE.finditer(text):
-        raw = m.group(3) if m.group(3) is not None else (
-            m.group(4) if m.group(4) is not None else m.group(5))
-        for tok in str(raw or "").split():
-            _add(tok)
-    if not wanted:
-        return text, []
-
-    got = netlist_facts.resolve_instance_refs(files, top, set(wanted))
-    # got 为空 = 网表太大建不了索引。**仍然继续** —— 引脚真实性可以用单实例探测
-    # 查（见 probe_instance_pins），只有"路径补全"才必须依赖索引。
-
-    notes = []
-
-    def _path_of(name, entry):
-        return entry["path"]
-
-    def _resolve(name):
-        # 解析器按**实例叶子名**建键；这里兼容「传全路径进来」的调用
-        if not got:
-            return None
-        ents = list(got.get(name) or got.get(name.rsplit("/", 1)[-1]) or [])
-        if "/" in name:
-            same = [e for e in ents
-                    if e["path"] == name or e["path"].endswith("/" + name)]
-            ents = same or ents
-        if len(ents) == 1:
-            return ents[0]
-        if ents:
-            ents.sort(key=lambda e: len(e["path"]))
-            if len(ents) > 1 and len(ents[0]["path"]) < len(ents[1]["path"]):
-                return ents[0]
-        return None
-
-    def _fix_one(tok):
-        star = "*" if tok.endswith("*") else ""
-        core = tok.rstrip("*")
-        ent = _resolve(core)
-        if ent and ent["path"] != core:
-            notes.append(f"路径补全 {core} -> {ent['path']}")
-            return ent["path"] + star
-        if "/" in core:
-            # 例外模式 `实例/前缀*`：末段是**名字前缀**不是实例，只补前缀部分
-            head, tail = core.rsplit("/", 1)
-            ent = _resolve(head)
-            if ent and ent["path"] != head:
-                notes.append(f"路径补全 {head} -> {ent['path']}")
-                return ent["path"] + "/" + tail + star
-        return tok
-
-    def _sub_elem(m):
-        head = m.group(1)
-        raw = m.group(2)
-        if raw.startswith('"'):
-            open_q, close_q = '"', '"'
-        elif raw.startswith("{"):
-            open_q, close_q = "{", "}"      # 曾写成 head+q+new+q -> `{u_clk_latch{`
-        else:
-            open_q = close_q = ""
-        inner = raw.strip('"').strip("{}")
-        new = " ".join(_fix_one(t) for t in inner.split())
-        return head + open_q + new + close_q
-
-    text = _REF_SCAN_ELEM_RE.sub(_sub_elem, text)
-    text = _REF_EXCLUDE_RE.sub(_sub_elem, text)
-
-    def _sub_assoc(m):
-        head = m.group(1)
-        raw = m.group(2)
-        q = "{" if raw.startswith("{") else ""
-        inner = raw.strip("{}").strip('"')
-        out = []
-        for tok in inner.split():
-            inst, sep, pin = tok.rpartition("/")
-            if not inst or _is_trusted(tok):      # 网表事实推出的引脚不校验
-                out.append(tok)
-                continue
-            ent = _resolve(inst)
-            if ent is not None:
-                pins = ent.get("pins") or set()
-                base_path = ent["path"]
-            else:
-                # 大网表：没有索引，只探这一个实例的引脚
-                pins = netlist_facts.probe_instance_pins(files, inst)
-                base_path = inst
-            if not pins:
-                out.append(tok)
-                continue
-            if pin and pin in pins:
-                out.append(f"{base_path}/{pin}")
-            else:
-                repl = None
-                for cand in _ASSOC_PIN_CANDIDATES:
-                    if cand in pins:
-                        repl = f"{base_path}/{cand}"
-                        break
-                if repl is None:
-                    q_pins = [p for p in sorted(pins) if p.lower().startswith("q")]
-                    if q_pins:
-                        repl = f"{base_path}/{q_pins[0]}"
-                if repl is None:
-                    notes.append(f"删除不存在的引脚引用 {tok}")
-                    continue
-                notes.append(f"引脚校正 {tok} -> {repl}")
-                out.append(repl)
-        if not out:
-            return ""
-        body = " ".join(out)
-        return head + (q + body + "}" if q else body)
-
-    text = _REF_ASSOC_RE.sub(_sub_assoc, text)
-    return text, notes
-
-
 def generate_from_config(task, understanding, facts=None):
     """
     根据结构化理解生成 dofile（规则模板）。
@@ -4996,39 +2643,6 @@ def generate_from_config(task, understanding, facts=None):
     # 无 LLM 理解时，用规则从 task_spec 兜底抽取
     if not understanding:
         understanding = _rule_extract_understanding(task)
-        if isinstance(understanding, dict):
-            understanding["_source"] = "rule"
-
-    # 实例引用回查真实网表：短名补全层级路径、不存在的引脚直接删掉。
-    # 必须在渲染之前做 —— 见 _resolve_refs_in_understanding 的说明。
-    try:
-        _resolve_refs_in_understanding(task, facts, understanding)
-    except Exception as _exc:                                   # noqa: BLE001
-        print(f"  ⚠ 实例引用回查失败（保持原样）：{_exc}")
-
-    # 下面三个 sanitize 的职责是「删掉**模型**臆造的配置」。    # 纯规则路径下所有取值本来就来自规则抽取（每一条都有句式依据），
-    # 没有臆造，因此必须跳过 —— 否则会把规则正确的 off_state / constant 一起删掉
-    # （2026-10-28 回归实测：纯规则 t1/case5 因此从"一致"退化成 2 处差异）。
-    # 判据用显式标记 `_source`，不靠"是否为空"猜 —— rule_understanding 的结果
-    # 非空但同样来自规则，用空值判断会误判。
-    if (understanding or {}).get("_source") != "rule":
-        # usage 有据才写（模型惯性会多补 all，见函数注释）
-        understanding = sanitize_usage_by_spec(understanding, task)
-        # off_state 按任务书依据校正（模型会把低有效写成 0，方向反了）
-        understanding = sanitize_off_state_by_spec(understanding, task)
-        # constant 有据才写（模型会按"测试模式该拉 0"的常识臆造）
-        understanding = sanitize_constant_by_spec(understanding, task)
-        # lockup 有据才写（模型会按"插链就该有 lockup"的常识臆造）
-        understanding = sanitize_lockup_by_spec(understanding, task)
-    # DFF→SFF 映射按任务书是否给出配对关系校验（纯规则路径也适用：
-    # 规则只在任务书给了配对表时才产生映射，这里做一次一致性收口）
-    understanding = sanitize_mappings_by_facts(understanding, facts, task)
-    # lockup latch 的落点：任务书只写"插入 lockup latch"（没写位置）时，
-    # 官方口径是 `-add_lockup true` 即满足；单时钟域设计的 lockup 唯一物理落点
-    # 是链尾（手册 2.1.2.4），此时补 `-insert_terminal_lockup true`。
-    # 做成**确定性后处理**而不是交给模型：两条路径（规则/LLM）结果必须一致，
-    # 实测模型会时给时不给，导致同一份任务书两次运行产物不同。
-    understanding = _apply_lockup_default(understanding, task, facts)
 
     # 事实与顶层纠正是本函数的**前置条件**，不是可选项：
     #   · task_spec 的「设计名称」是产品名，未必等于网表顶层模块名（case6 写 des_perf、
@@ -5100,38 +2714,10 @@ def generate_from_config(task, understanding, facts=None):
     lines.append(f"present_design {top}")
     lines.append("")
 
-    # 补齐「任务书要求新建、网表还没有」的端口。必须放在 present_design 之后、
-    # 任何 set_scan_signal 之前 —— 否则 set_scan_signal 会报 SCAN-4610。
-    missing_ports = _ports_required_but_absent(task, understanding, facts)
-    if missing_ports:
-        lines.append("# ── 补齐任务书要求新建的端口 ─────────────────────────")
-        # 语法以手册 add_port.md 为准：port_list 是 Tcl 列表，-direction 只接受
-        # in / out / inout（默认 in）。写成 -direction input 会报 COM-3005，
-        # 端口建不出来，后面的 set_scan_signal / DFTR 全部连锁失败。
-        # 扫描相关的新建端口都是输入，且按手册示例一次给列表更紧凑。
-        lines.append("add_port {" + " ".join(missing_ports) + "} -direction in")
-        lines.append("")
-
     # scan cell mapping
     mappings = []
     if understanding and understanding.get("scan_cell_mappings"):
-        # 只在「仅替换、不插链」的流程里显式写映射：那时结果是"把 DFF 换成 SFF"，
-        # 映射本身就是交付要求（public/task_1/case1 的 golden 有 4 对，正是任务书
-        # 那张 DFF|SFF 表）。插链流程里 replace 默认 True，工具自己替换，
-        # 官方 golden case2~case6 一律**不写** set_scan_cell_mapping。
-        # 用 decide_workflow() 判定（understanding 里可能没有 workflow 字段，
-        # 要靠任务书语义兜底；直接读 understanding["workflow"] 会是 None）。
-        #
-        # 【例外】任务书**自己给了映射表**时必须写（2026-10-31 新 case 实测：
-        # t1/c2 是 full_scan，但第 2 条要求就是"指定四类 DFF→SFF 映射"，
-        # golden 也照写；只按流程判会把它整段漏掉）。
-        # 判据用规则解析结果，不信模型 —— 没表的 case 解析结果为空，不会误开闸门。
-        _spec = (task or {}).get("task_spec", "") or ""
-        # 任务书把映射写成要求（有 "扫描映射" 表头 / 明确要求句）时，插链流程也要写
-        _wants = spec_requires_cell_mapping(_spec) and bool(_cell_mappings_from_spec(_spec))
-        _replace_only = "full_scan" not in decide_workflow(task, understanding)
-        if _replace_only or _wants:
-            mappings = understanding["scan_cell_mappings"]
+        mappings = understanding["scan_cell_mappings"]
     if mappings:
         lines.append("# ── DFF → SFF 映射 ─────────────────────────────────────")
         for dff, sff in mappings:
@@ -5180,37 +2766,11 @@ def generate_from_config(task, understanding, facts=None):
         lines.append(f"set_scan_signal -type constant -port {c.get('port','')} -constant_value {c.get('value', 1)}")
 
     # scan_enable（只生成 role 明确为 scan_enable 的信号；向后兼容：无 role 视为 scan）
-    partitions = (understanding or {}).get("partitions") or []
-    se_list = [] if partitions else [
-        s for s in ((understanding or {}).get("scan_enable_signals") or [])
-        if s.get("role", "scan_enable") != "described_only"]
-    # 有分区时，scan_enable 由各分区分别声明（golden 也是这么写的），
-    # 全局再声明一遍会让默认分区也吃到同一个使能。
-    spec_text = task.get("task_spec", "") or ""
-    for se in se_list:
+    for se in (understanding or {}).get("scan_enable_signals") or []:
         if se.get("role", "scan_enable") == "described_only":
             continue
         cmd = f"set_scan_signal -type scan_enable -port {se.get('port','')}"
-        # 【旧实现在这里做「有 ICG 就把 -usage scan 提升为 all」，2026-10-27 撤掉】
-        # 依据官方 golden：public/task_1/case5 同时有
-        #     set_scan_signal -type scan_enable -port pad_yy_scan_enable  -usage scan
-        #     set_scan_signal -type scan_enable -port pad_yy_icg_scan_en -usage clock_gating
-        # 也就是「扫描链使能」与「门控使能」是两个独立信号，各自 -usage。
-        # 一律改成 all 会让扫描使能也去驱动 ICG，与参考实现不一致。
-        #
-        # 真正需要 all 的场景（tv80 的 DFTR9×351）是：设计有 ICG，但**只有一个**
-        # 扫描使能、且任务书要求它覆盖时钟门控 —— 三者同时成立才提升。
         _usage = normalize_usage(se.get("usage"))
-        _only_one_se = len(se_list) == 1
-        _spec_covers_icg = spec_covers_icg_and_scan(spec_text)
-        if _usage == "scan" and _only_one_se and _spec_covers_icg and _has_icg_cells(facts):
-            print("  ⚠ 唯一扫描使能且任务书要求覆盖时钟门控，-usage scan 提升为 all",
-                  file=sys.stderr)
-            _usage = "all"
-        # 剩余的 `-usage scan` 再按 golden 判据过滤：门控另有使能 / 题面说只管扫描
-        # 才保留，否则省略（见 _resolve_se_usage）。
-        if _usage == "scan":
-            _usage = _resolve_se_usage(se, se_list, spec_text, facts)
         if _usage:
             cmd += f" -usage {_usage}"
         # 只有显式提供 off_state 才追加（LLM 可能误填默认 0）
@@ -5244,18 +2804,8 @@ def generate_from_config(task, understanding, facts=None):
     if understanding and understanding.get("scan_element_exclude"):
         lines.append("")
         lines.append("# ── 不可扫描元素 ─────────────────────────────────────")
-        _ex = list(understanding["scan_element_exclude"])
-        _ex_set = set(_ex)
-        for elem in _ex:
-            # `X/*` 与 `X` 是同一棵子树，两份都写纯属重复
-            # （t1/case3 实测：LLM 理解额外给了 `X/*`，golden 只有 `X`）。
-            if elem.endswith("/*") and elem[:-2] in _ex_set:
-                continue
+        for elem in understanding["scan_element_exclude"]:
             lines.append(f'set_scan_element false "{elem}"')
-        # 「除了 X* 之外都不允许串链」里的那个例外必须显式放回来，
-        # 否则上面那条 false 会把整棵子树（含例外）一起排除。
-        for pat in understanding.get("scan_element_include") or []:
-            lines.append(f'set_scan_element true "{pat}"')
 
     # scan segment
     #
@@ -5263,13 +2813,6 @@ def generate_from_config(task, understanding, facts=None):
     # 后者用的 si/se/so 是本 case 网表里追踪出的真实路径，hidden case 同样适用，
     # 不依赖任何参考答案。
     segments = (understanding or {}).get("scan_segments") or []
-    if segments and not wants_scan_segments(task, understanding):
-        # **有据才写**：任务书没要求「长移位寄存器配成 scan segment」时，任何来源
-        # （LLM 理解 / LLM 计划 / 参考 dofile）带来的段都不落地。
-        # 依据（2026-10-30，t1/case2）：模型自己编了 7 条 set_scan_segment，
-        # si/se/so 路径也是编的，而 golden 一条都没有 —— 段会让工具把那些寄存器
-        # 整段当不可拆分单元，直接改掉链结构。
-        segments = []
     if segments:
         lines.append("")
         lines.append("# ── scan segment ─────────────────────────────────────")
@@ -5284,7 +2827,7 @@ def generate_from_config(task, understanding, facts=None):
             )
     elif fd["segments"]:
         lines.append("")
-        lines.append(f"# ── scan segment（由网表事实生成，共 {fd.get('segment_count') or len(fd['segments'])} 条）───")
+        lines.append(f"# ── scan segment（由网表事实生成，共 {len(fd['segments'])} 条）───")
         lines.extend(fd["segments"])
 
     # DRC 规则豁免：只认 task_spec 原文明确要求忽略的规则号（手册 2.1.3.3 白名单），
@@ -5309,7 +2852,7 @@ def generate_from_config(task, understanding, facts=None):
     wcfg = (understanding or {}).get("wrapper_cfg") or {}
     if wcfg.get("enabled"):
         lines.append("# ── Wrapper 配置 ─────────────────────────────────────")
-        style = _wrapper_style(wcfg.get("style"))
+        style = wcfg.get("style", "shared")
         cmd = f"set_wrapper_cfg enable -style {style}"
         if wcfg.get("chain_count"):
             cmd += f" -chain_count {wcfg['chain_count']}"
@@ -5329,7 +2872,7 @@ def generate_from_config(task, understanding, facts=None):
                     f" -output_capture_enable {_es['wrp_out_capture_en']}")
         lines.append(cmd)
         for ps in wcfg.get("port_specific", []):
-            style = _wrapper_style(ps.get("style"))
+            style = ps.get("style", "shared")
             pcmd = f"set_wrapper_cfg -style {style}"
             if style == "dedicated" and ps.get("dedicated_cell_type"):
                 pcmd += f" -dedicated_cell_type {ps['dedicated_cell_type']}"
@@ -5342,91 +2885,26 @@ def generate_from_config(task, understanding, facts=None):
     # scan cfg
     scfg = (understanding or {}).get("scan_cfg") or {}
     scan_cfg_parts = []
-    # 每个值都过 tcl_scalar：LLM 可能给出分区字典/列表（见函数注释），
-    # 直接插值会写出 `-chain_count {'a': 2, ...}` 这种非法 Tcl。
-    _cc = tcl_scalar(scfg.get("chain_count"))
-    if _cc:
-        scan_cfg_parts.append(f"-chain_count {_cc}")
-    _ml = tcl_scalar(scfg.get("max_length"))
-    if _ml:
-        scan_cfg_parts.append(f"-max_length {_ml}")
+    if scfg.get("chain_count"):
+        scan_cfg_parts.append(f"-chain_count {scfg['chain_count']}")
+    if scfg.get("max_length"):
+        scan_cfg_parts.append(f"-max_length {scfg['max_length']}")
     if scfg.get("mix_clocks") is not None:
         scan_cfg_parts.append(f"-mix_clocks {'true' if scfg['mix_clocks'] else 'false'}")
     if scfg.get("mix_edges") is not None:
         scan_cfg_parts.append(f"-mix_edges {'true' if scfg['mix_edges'] else 'false'}")
-    _ic = tcl_scalar(scfg.get("internal_clocks"))
-    # 题面明确写了「识别/排除内部时钟域」时以题面为准，压过模型的选择
-    # （模型在这个字段上倾向一律给 multi，见 internal_clocks_from_spec 注释）。
-    _ic_spec = internal_clocks_from_spec((task or {}).get("task_spec", "") or "")
-    if _ic_spec:
-        if _ic and _ic != _ic_spec:
-            print(f"  ⚠ 内部时钟档位：模型给 {_ic}，题面要求 {_ic_spec} → 以题面为准",
-                  file=sys.stderr)
-        _ic = _ic_spec
-    if _ic:
-        scan_cfg_parts.append(f"-internal_clocks {_ic}")
-    _si = tcl_scalar(scfg.get("si_port_format"))
-    if _si:
-        scan_cfg_parts.append(f'-si_port_format "{_si}"')
-    _so = tcl_scalar(scfg.get("so_port_format"))
-    if _so:
-        scan_cfg_parts.append(f'-so_port_format "{_so}"')
+    if scfg.get("internal_clocks"):
+        scan_cfg_parts.append(f"-internal_clocks {scfg['internal_clocks']}")
+    if scfg.get("si_port_format"):
+        scan_cfg_parts.append(f'-si_port_format "{scfg["si_port_format"]}"')
+    if scfg.get("so_port_format"):
+        scan_cfg_parts.append(f'-so_port_format "{scfg["so_port_format"]}"')
     if scfg.get("add_lockup") is not None:
         scan_cfg_parts.append(f"-add_lockup {'true' if scfg['add_lockup'] else 'false'}")
-    # 以下三项 2026-10-28 补齐：任务书要求「插入 lockup latch」时，单时钟域没有
-    # 跨域边界，唯一落点是链尾 lockup（手册 2.1.2.4）。
-    for _key in ("replace", "respect_sff_se_connection", "insert_terminal_lockup"):
-        if scfg.get(_key) is not None:
-            scan_cfg_parts.append(f"-{_key} {'true' if scfg[_key] else 'false'}")
-    if partitions:
-        # 分区模式下，链数/链长/混时钟是**逐分区**配置（golden 如此），
-        # 全局只留共享项（add_lockup / mix_edges / 端口格式）。
-        scan_cfg_parts = [p for p in scan_cfg_parts
-                          if not p.startswith(("-chain_count", "-max_length", "-mix_clocks"))]
     if scan_cfg_parts:
         lines.append("# ── 扫描链配置 ───────────────────────────────────────")
         lines.append("set_scan_cfg " + " \\\n    ".join(scan_cfg_parts))
         lines.append("")
-
-    if partitions:
-        _max_len = tcl_scalar(scfg.get("max_length")) or partition_max_length(task)
-        _mix = scfg.get("mix_clocks")
-        _mix_txt = "false" if _mix is None else ("true" if _mix else "false")
-        lines.append("# ── 定义扫描分区 ─────────────────────────────────────")
-        for p in partitions:
-            insts = p.get("include") or []
-            clks = p.get("clocks") or []
-            _excl = p.get("exclude") or []
-            _rise = p.get("rising_edge_clocks") or []
-            if not (insts or clks):
-                # 既没实例也没时钟：`add_scan_partition p` 单参数大概率不被接受，
-                # 与其写一条可疑命令，不如跳过并把原因写进注释（可追溯）。
-                lines.append(f"# 跳过分区 {p['name']}：题面未给实例或时钟，无法构造 -include/-clocks")
-                continue
-            _seg = []
-            if insts:
-                _seg.append(f"-include {{ {' '.join(insts)} }}")
-            else:
-                _seg.append(f"-clocks {{ {' '.join(clks)} }}")
-            if _excl:
-                _seg.append(f"-exclude {{ {' '.join(_excl)} }}")
-            if _rise:
-                _seg.append(f"-rising_edge_clocks {{ {' '.join(_rise)} }}")
-            lines.append(f"add_scan_partition {p['name']} " + " ".join(_seg))
-        lines.append("")
-        for p in partitions:
-            if p.get("desc"):
-                lines.append(f"# {p['name']}：{p['desc']}")
-            lines.append(f"set_current_scan_partition {p['name']}")
-            bits = [f"-chain_count {p['chain_count']}"]
-            _pmax = tcl_scalar(p.get("max_length")) or _max_len
-            if _pmax:
-                bits.append(f"-max_length {_pmax}")
-            bits.append(f"-mix_clocks {_mix_txt}")
-            lines.append("set_scan_cfg " + " ".join(bits))
-            if p.get("se"):
-                lines.append(f"set_scan_signal -type scan_enable -port {p['se']}")
-            lines.append("")
 
     # workflow 已在上方（DFT 信号段之前）求值，此处直接复用
     # 本 case 的产物清单（报告 / CTL / SCANDEF 命名）；
@@ -5522,1158 +3000,7 @@ def _brief_understanding(u):
     return json.dumps(brief, ensure_ascii=False, indent=2)
 
 
-# ============================================================================
-# R22：两段式 —— LLM 只出「计划 JSON」，dofile 由确定性渲染器生成
-# ----------------------------------------------------------------------------
-# 为什么要拆（2026-10-26 实测，同一 case、同一模型 deepseek-v4-pro-0813）：
-#     要完整 dofile   : 260.2s，reasoning 16451 tokens，118s 窗口内 0 输出
-#     只要计划(≤40行) :  39.3s，1505 字符，决策正确
-# 评测给 150s 预算的 case，预运行窗口只有 120s —— 前者结构上装不下，后者绰绰有余。
-#
-# 分工：模型负责「做什么」（工作流、扫描信号、DFF→SFF、链参数、DRC 豁免），
-#       代码负责「怎么写」（命令拼装、路径、产物补齐）——
-#       后者本来就能渲染出 DRC 清零的 dofile（测试6 的 11 个 case 全走它）。
-#
-# 回退：设 SCAN_AGENT_LLM_MODE=full 可切回旧的「LLM 直出整份 dofile」。
-# ============================================================================
-
-_PLAN_SYSTEM_BASE = """你是 dftexp_scan（Scan Insertion）工具的专家，本系统的**决策者**。
-请只输出一个 JSON 对象，描述本 case 需要怎么配置；**不要写 Tcl，不要解释**。"""
-
-_PLAN_SYSTEM_REVIEW = _PLAN_SYSTEM_BASE + """
-
-你拿到的是一份由规则从任务书机械誊出的「草稿」。请**以任务书与手册为依据**，
-对它做语义决策：哪里错了就改、哪里漏了就补、哪里多余就删。
-**只输出需要改动的字段**（整字段覆盖，不是增量）；全部正确时输出 `{}`。
-草稿没覆盖、但任务书明确要求的配置，也必须写出来。"""
-
-_PLAN_SYSTEM_AUTHOR = _PLAN_SYSTEM_BASE + """
-
-输出的是**完整决策**（不是差值）：哪怕某项与「参考草稿」一致，也要写出来。
-参考草稿只可作为交叉验证，若它与任务书冲突，**以任务书为准**并在 JSON 里给出你的取值。"""
-
-
-def plan_system_prompt(mode=None):
-    """按计划模式取系统提示词。
-
-    必须按模式区分：review 模式喂「完整决策」的措辞会让模型把草稿里所有
-    字段原样重吐一遍，于是差值合并退化成整体覆盖 —— 规则侧算出的内部时钟、
-    lockup 落点全被抹掉（2026-10-28 实测 t1/case5 曾因此丢 9 条声明）。
-    """
-    m = (mode or PLAN_MODE or "review").strip().lower()
-    return _PLAN_SYSTEM_AUTHOR if m == "author" else _PLAN_SYSTEM_REVIEW
-
-
-# 兼容旧引用（外部工具若直接取常量，拿到的是默认模式的提示词）。
-PLAN_SYSTEM_PROMPT = _PLAN_SYSTEM_REVIEW
-
-
-# 计划模式：
-#   "review" —— 规则先出确定性草稿，LLM 在其上做**语义决策**（改/加/删），
-#               差值合并（默认）
-#   "author" —— LLM 从零出完整决策，规则只做校验/纠正/渲染
-#
-# 【为什么默认 review（2026-10-28 实测）】
-# 同一套 public case、同一模型、同样关思考：
-#     author（LLM 完整决策）：6 个 task_1 case，0 个与 golden 一致
-#     review（草稿+LLM 决策）：8/11 一致
-# 差距来自确定性信息的覆盖：DFF→SFF 映射、顶层端口清单、分区表、输出产物名
-# 这些**算得出来**的东西让模型重写一遍只会漏（实测 case5 漏 9 条内部时钟、
-# case4 多抽 5 对映射）。让模型把算力花在「规则读不懂的语义」上才划算。
-#
-# 注意 review **不是**「规则模板主导」：规则只负责把任务书表格机械誊成草稿，
-# 所有需要判断的地方（单/多时钟域、lockup 落点、边沿策略、usage 语义、
-# 分区归属）都由 LLM 定。规则既不能改 LLM 的取值，也不会替它补语义字段
-# （merge_understanding 只补 LLM 留空的确定性字段）。
-# 环境变量 SCAN_AGENT_PLAN_MODE 可切 author 做对照。
-PLAN_MODE = (os.environ.get("SCAN_AGENT_PLAN_MODE") or "review").strip().lower()
-
-# 「疑点复核」需要的最少剩余秒数。
-# 复核 = 一次开思考的调用，实测 62.9~68.0s；给到 70s 才发，否则宁可保留快档决策
-# （发出去也会被流式守护砍掉，白烧一轮还可能挤掉工具运行时间）。
-_PLAN_REVIEW_MIN_S = float(
-    os.environ.get("SCAN_AGENT_PLAN_REVIEW_MIN_S", "70"))
-# 关思考复核只需一次短调用（实测 6~7s），给 12s 余量即可。
-_PLAN_REVIEW_FAST_MIN_S = float(
-    os.environ.get("SCAN_AGENT_PLAN_REVIEW_FAST_MIN_S", "12"))
-
-# 计划里允许覆盖的结构化理解字段（与 rule_understanding 同构）
-_PLAN_FIELDS = ("workflow", "clock_signals", "reset_signals", "scan_enable_signals",
-                "constant_signals", "scan_cell_mappings", "scan_cfg", "drc_rules")
-
-# workflow 合法步骤（渲染器只认这几个）
-_WF_STEPS = ("connect_icg_only", "replace_only", "replace_unscan", "full_scan")
-
-# scan_cfg 里「任务书逐字给出、不该由模型改动」的数值项。
-# chain_count / max_length 是从任务书原文正则精确取到的，模型偶尔会算错或
-# 按自己的理解"优化"掉（实测 t1/case3：任务书 70 条链，模型回 55）。
-# 这两个数字直接决定链的切分，改错就是结构性错误，所以规则值优先。
-_SPEC_NUMERIC_CFG = ("chain_count", "max_length")
-
-
-
-# ============================================================================
-# DFT 分区（Partition）流
-# ----------------------------------------------------------------------------
-# 依据官方 golden（public/task_1/case2）：
-#     add_scan_partition rx_fifo_partition -include {u9 u10 u11}
-#     set_current_scan_partition rx_fifo_partition
-#     set_scan_cfg -chain_count 2 -max_length 300 -mix_clocks false
-#     set_scan_signal -type scan_enable -port se_rx_fifo
-# 任务书给了「分区名 + chain_count + 功能区域描述」，但**不给实例清单**
-# （实例是 u0~u26，只有网表里有）。所以分工是：
-#   规则：读分区表 / 读顶层实例 / 渲染命令；
-#   LLM ：判断「哪个实例属于哪个功能区域」（这一步靠类型名，如 ac97_out_fifo_*）。
-# ============================================================================
-
-PARTITION_SYSTEM_PROMPT = """你是芯片 DFT 分区专家。只输出一个 JSON 对象，不要解释。"""
-
-
-def partition_table_from_spec(spec):
-    """
-    解析任务书的分区表，返回 [{name, chain_count, desc, se}]。
-
-    三类表格都可能出现（case2 里三张都有）：
-      | 分区名称 | 归属功能区域 | 说明 |      -> 名称 + 描述
-      | 分区 | chain_count | 理由 |           -> 名称 + 链数
-      | se_xxx | 分区名 | 说明 |              -> 分区专用的 scan_enable
-    """
-    if not spec:
-        return []
-    parts = {}
-
-    for name, cc in re.findall(
-            r"^\|\s*`?([a-z_0-9]+_partition)`?\s*\|\s*(\d+)\s*\|", spec, re.M):
-        parts.setdefault(name, {})["chain_count"] = int(cc)
-
-    for name, desc in re.findall(
-            r"^\|\s*`?([a-z_0-9]+_partition)`?\s*\|\s*([^|\d][^|]{1,40})\|", spec, re.M):
-        parts.setdefault(name, {}).setdefault("desc", desc.strip())
-
-    for se, name in re.findall(
-            r"^\|\s*`?(se_[a-z_]+)`?\s*\|\s*`?([a-z_0-9]+_partition)`?\s*\|", spec, re.M):
-        parts.setdefault(name, {})["se"] = se
-
-    # 表头驱动的解析：`| 分区 | -clocks | chain_count | max_length | scan_enable |`
-    #
-    # 上面的三条正则假定「名字后面紧跟链数」，遇到带 `-clocks` 列的新写法就整张表
-    # 丢掉（2026-10-31 十个新 case：t1/c2 与 t2/c3 的分区全空，直接影响 5 分项）。
-    # 这里按表头关键词定列，再按列取值，列序无关。
-    for row in _partition_rows_by_header(spec):
-        name = row.get("name")
-        if not name:
-            continue
-        cur = parts.setdefault(name, {})
-        for k in ("chain_count", "max_length"):
-            if row.get(k) is not None:
-                cur[k] = row[k]
-        if row.get("clocks"):
-            cur["clocks"] = row["clocks"]
-        if row.get("se"):
-            cur["se"] = row["se"]
-
-    # 键**必须存在**（可以是空列表）：下游有多处 `p["clocks"]` 的直接访问，
-    # 只要表里有部分行的时钟列是空占位（`—` / 空单元格 / 「按实例」），
-    # 就会出现「有的分区有 clocks 键、有的没有」→ KeyError: 'clocks' 整个 case 崩掉。
-    # 2026-11-01 第五轮新 case 实测（按实例划分分区的题面）。
-    for v in parts.values():
-        v.setdefault("clocks", [])
-
-    return [dict(name=k, **v) for k, v in parts.items() if "chain_count" in v]
-
-
-_PART_COL_KEYS = (
-    ("name", ("分区", "partition")),
-    ("clocks", ("-clocks", "clocks", "时钟")),
-    ("chain_count", ("chain_count", "链数")),
-    ("max_length", ("max_length", "链长")),
-    ("se", ("scan_enable", "扫描使能", "使能")),
-)
-
-# 分区表里「没有时钟」的占位写法 —— 不能被当成端口名
-_CLOCK_PLACEHOLDERS = frozenset({
-    "", "-", "--", "—", "——", "/", "N/A", "n/a", "NA", "无", "默认", "(默认)", "（默认）",
-    "实例", "按实例", "n/a", "none", "None",
-})
-
-
-def _partition_rows_by_header(spec):
-    """
-    按表头定列解析分区表，返回 [{name, clocks, chain_count, max_length, se}]。
-
-    只在表头同时出现「分区」列与前两种列（时钟 / 链数）之一时才认，
-    避免把「分区名称 | 归属功能区域 | 说明」这类纯说明表误当成分区配置表。
-    """
-    if not spec:
-        return []
-    lines = spec.splitlines()
-    rows, i = [], 0
-    while i < len(lines):
-        ln = lines[i].strip()
-        if not ln.startswith("|"):
-            i += 1
-            continue
-        cells = [c.strip() for c in ln.strip("|").split("|")]
-        colmap = {}
-        for idx, c in enumerate(cells):
-            low = c.lower()
-            for key, kws in _PART_COL_KEYS:
-                if key in colmap:
-                    continue
-                if any(kw in low for kw in kws):
-                    colmap[key] = idx
-        if "name" not in colmap or not ("chain_count" in colmap or "clocks" in colmap):
-            i += 1
-            continue
-        i += 1
-        while i < len(lines) and re.match(r"^\s*\|[\s:|-]*\|\s*$", lines[i]):
-            i += 1                      # 分隔行 |---|---|
-        while i < len(lines) and lines[i].strip().startswith("|"):
-            cs = [c.strip().strip("`") for c in lines[i].strip().strip("|").split("|")]
-            if len(cs) <= max(colmap.values()):
-                break
-            row = {}
-            for key, idx in colmap.items():
-                val = cs[idx].strip().strip("`")
-                if key == "chain_count" or key == "max_length":
-                    m = re.match(r"^\s*(\d+)\s*$", val)
-                    if m:
-                        row[key] = int(m.group(1))
-                elif key == "clocks":
-                    # 空占位符不算时钟：表里常见「—」「-」「N/A」「无」「默认」，直接分词
-                    # 会把它们当成端口名写进 -clocks，工具报端口不存在。
-                    _cl = [v for v in re.split(r"[\s,{}`]+", val)
-                           if v and v not in _CLOCK_PLACEHOLDERS]
-                    if _cl:
-                        row[key] = _cl
-                elif val:
-                    row[key] = val
-            if row.get("name"):
-                rows.append(row)
-            i += 1
-    return rows
-
-
-def instance_regions_from_spec(spec):
-    """
-    从任务书的「实例清单」表里抽出 `实例名 -> 功能区域`。
-
-    为什么需要（2026-10-28 t1/case2 实测）：
-    该 case 的任务书第 81~82 行明确写了
-        | u14 | ac97_prc | 功耗控制 | clk_i | ~29 |
-        | u15 | ac97_cra | 控制寄存器访问逻辑 | clk_i | ~24 |
-    而 ctrl_partition 的定义是「控制逻辑 + 中断 + 复位 … 功耗控制、DMA、9 路中断…」——
-    「功耗控制」四个字两边都有，本来是可以确定性匹配的。
-    但 `assign_partitions` 只把「实例名（模块类型）」交给模型，**把这一列丢了**，
-    模型只能按 ac97_prc / ac97_cra 猜，于是把 u14/u15 猜成了 reg_partition
-    （因为 cra 看着像 register access）。
-
-    这个函数把这列捞回来：既能喂给模型做语义匹配，也能直接做关键词匹配。
-
-    表头需要同时含「实例」和「功能」两列（不同 case 表头措辞略异）。
-    返回 {实例名: 功能区域描述}。
-    """
-    if not spec:
-        return {}
-    out = {}
-    for rows in _table_blocks(spec):
-        if not rows:
-            continue
-        head = _cells(rows[0])
-        i_inst = i_func = None
-        for i, c in enumerate(head):
-            if i_inst is None and re.search(r"实例|instance|^单元", c, re.I):
-                i_inst = i
-            elif i_func is None and re.search(r"功能|区域|用途|说明|function", c, re.I):
-                i_func = i
-        if i_inst is None or i_func is None:
-            continue
-        for row in rows[1:]:
-            cells = _cells(row)
-            if len(cells) <= max(i_inst, i_func):
-                continue
-            inst = cells[i_inst].strip().strip("`")
-            func = cells[i_func].strip()
-            if re.match(r"^[A-Za-z_]\w*$", inst) and func:
-                out[inst] = func
-    return out
-
-
-def assign_partitions(task, understanding, facts, llm, max_tokens=4000):
-    """
-    让 LLM 把顶层实例划到各个分区，结果写进 understanding["partitions"]。
-
-    校验（宁可少划也不能划错）：
-      · 实例名必须在网表顶层实例清单里；
-      · 每个实例最多出现在一个分区（重复时保留先出现的）；
-      · 划不出任何实例的分区丢弃（空分区会让工具报错或产出空链）。
-    返回说明列表（用于日志）。
-    """
-    if (understanding or {}).get("partitions"):
-        return []
-
-    spec = (task or {}).get("task_spec", "") or ""
-    table = partition_table_from_spec(spec)
-    if not table:
-        return []
-
-    # 表里带 `-clocks` 列时**直接照抄**，不调模型。
-    #
-    # 依据（2026-10-31 新 case 的 t1/c2）：分区表写的是
-    #   | 分区 | -clocks | chain_count | max_length | scan_enable |
-    #   | `wb_partition` | `wb_clk_i` | 28 | 200 | `se_wb` |
-    # 分区本就是"按哪个时钟域"定义的，工具自己知道哪些 FF 挂在哪个时钟下。
-    # 让模型逐实例去划，只会把 `-clocks` 换成一份可能漏项的 `-include` 清单
-    # （实测它把 RxAbort_latch_reg 这类寄存器划进了 rx_partition），
-    # 还白花一次 LLM 调用。
-    #
-    # **但只有整表按时钟域划分时才照抄**：题面也可能写「按归属实例划分」的分区表，
-    # 只给个别行填了时钟列（其余是 `—` / 空 / 「按实例」）。那时一刀切照抄会把
-    # 没时钟的分区丢掉，或对 `p["clocks"]` 直接取键而 KeyError（2026-11-01 第五轮
-    # 新 case 实测整 case 崩溃，未产出 dofile）—— 这种情况交给下面的逐实例路径。
-    _with_clk = [p for p in table if p.get("clocks")]
-    _no_clk = [p for p in table if not p.get("clocks")]
-
-    def _mk_part(p, clocked):
-        item = {"name": p["name"], "chain_count": p.get("chain_count") or 1,
-                "clocks": list(p.get("clocks") or [])}
-        if p.get("max_length"):
-            item["max_length"] = p["max_length"]
-        if p.get("se"):
-            item["se"] = p["se"]
-        if p.get("desc") and "/" not in p["desc"]:
-            item["desc"] = p["desc"]
-        if not clocked:
-            item.pop("clocks", None)          # 没时钟就不写这个键，避免下游误用空 -clocks
-        return item
-
-    if _with_clk and not _no_clk:
-        parts = [_mk_part(p, True) for p in table]
-        understanding["partitions"] = parts
-        return [f"分区（按时钟域，取自说明书的 -clocks 列）：{p['name']}" for p in parts]
-
-    # 混合表（部分行有时钟）+ 没有模型：只保留有时钟的行，其余如实说明跳过。
-    # 宁可少划，也不能造出没有 -clocks 也没有 -include 的空分区。
-    if _with_clk and _no_clk and not (llm and getattr(llm, "available", False)):
-        parts = [_mk_part(p, True) for p in _with_clk]
-        understanding["partitions"] = parts
-        return ([f"分区（按时钟域）：{p['name']}" for p in parts]
-                + [f"跳过分区 {p['name']}：题面未给时钟列，且无 LLM 无法逐实例划分"
-                   for p in _no_clk])
-
-    # 到这里就需要逐实例划分了 —— 没有模型就做不了（宁可不分区，也不瞎划）
-    if not llm or not getattr(llm, "available", False):
-        return ["无 LLM，跳过分区（表里没有 -clocks 列，需逐实例划分）"]
-
-    insts = _top_instances(task, facts)
-    if not insts:
-        return ["网表里没解析到顶层实例，跳过分区"]
-
-    # 实例清单：带上任务书写明的**功能区域**，别只给模块类型。
-    # 只给模块名时模型只能猜（实测把 ac97_cra 猜成寄存器组），
-    # 而"功耗控制""控制寄存器访问逻辑"这些描述本来就写在任务书里。
-    regions = instance_regions_from_spec(spec)
-    lines = []
-    for name, mtype in insts:
-        func = regions.get(name)
-        lines.append(f"- {name}（{mtype}，功能区域：{func}）" if func
-                     else f"- {name}（{mtype}）")
-    parts_desc = "\n".join(
-        f"- {p['name']}：{p.get('desc', '')}，chain_count={p['chain_count']}"
-        for p in table)
-
-    # 可用的 scan_enable 候选：任务书全局声明的 + se 表里点名的
-    se_cands = [str(s.get("port") or "").strip()
-                for s in ((understanding or {}).get("scan_enable_signals") or [])]
-    for p in table:
-        if p.get("se"):
-            se_cands.append(p["se"])
-    se_cands = sorted({s for s in se_cands if s})
-
-    prompt = f"""# 任务书的分区定义
-{parts_desc}
-
-# 顶层实例清单（实例名（模块类型，功能区域））
-{chr(10).join(lines)}
-
-# 可用的 scan_enable 信号
-{', '.join(se_cands) if se_cands else '（任务书未给，留空）'}
-
-# 任务
-1) 把每个实例分到一个分区。
-   依据是**实例的功能区域描述与分区描述的文字对应**，而不是只看模块名前缀。
-   例如功能区域写「功耗控制」，而 ctrl_partition 的描述里也列了「功耗控制」，
-   那就应该划到 ctrl_partition —— 哪怕模块名叫 ac97_prc 看着像别的。
-   只在功能区域与某分区描述**确有对应词**时才划；完全对不上的不要列出。
-2) 给每个分区指定用哪个 scan_enable（多个分区可以共用一个）。
-
-只输出 JSON：{{"<分区名>": {{"include": ["<实例名>", ...], "se": "<scan_enable>"}}}}"""
-
-    # 分区归属是「模块类型名 → 功能区域」的语义匹配，属匹配题不是推导题。
-    # 关思考足够（实测数秒），且省 token —— 开思考时 reasoning 会吃满 4000 的
-    # 输出闸门导致正文为空（2026-10-28 t1/case2 实测：整次分区归属失败）。
-    data = llm.chat_json(PARTITION_SYSTEM_PROMPT, prompt, max_tokens=max_tokens,
-                         thinking=False)
-    if not isinstance(data, dict):
-        return ["LLM 未给出分区归属，跳过分区"]
-
-    known = {name for name, _ in insts}
-    used, out = set(), []
-    for p in table:
-        raw = data.get(p["name"]) or {}
-        if isinstance(raw, list):            # 兼容只给实例列表的老格式
-            picked, se = raw, ""
-        elif isinstance(raw, dict):
-            picked, se = raw.get("include") or [], str(raw.get("se") or "").strip()
-        else:
-            continue
-        keep = []
-        for inst in picked:
-            inst = str(inst).strip()
-            if inst in known and inst not in used:
-                keep.append(inst)
-                used.add(inst)
-        if not keep:
-            continue
-        # se 必须在候选里；LLM 没给或给了不存在的，就退回任务书 se 表的映射
-        if se not in se_cands:
-            se = p.get("se") or ""
-        out.append(dict(p, include=keep, se=se))
-
-    if not out:
-        return ["分区归属为空，跳过分区"]
-
-    understanding["partitions"] = out
-    return [f"分区 {p['name']}：{len(p['include'])} 个实例" for p in out]
-
-
-def _top_instances(task, facts):
-    try:
-        import netlist_facts
-        return netlist_facts.top_instances(task, facts)
-    except Exception:                                       # noqa: BLE001
-        return []
-
-
-def _plan_manual_context(task, understanding, facts=None):
-    """
-    为**决策阶段**检索手册片段。
-
-    为什么单独做一个（2026-10-28 修正）：
-    `_retrieve_manual_for_generation` 只服务旧的 `full` 模式（LLM 直出 Tcl），
-    而默认路径是 `plan` 模式。结果是：LLM 做决策时**看不到手册**，只能看我
-    写进 prompt 的几条要点 —— 那些要点本质是把手册知识压缩成规则，等于用
-    我的理解替代手册。hidden case 一旦考到我没想到的章节，LLM 就只能猜。
-
-    这里让决策阶段真去查手册，query 侧重「这一步要定的东西」：
-      · scan_cfg 的时钟/边沿/内部时钟/lockup 语义（本 case 最常出错的地方）
-      · 单时钟域与多时钟域的差别
-      · 任务书原文里出现的命令名
-    命中结果原样贴进 prompt，由模型自己判读。
-    """
-    query_parts = []
-
-    spec = (task or {}).get("task_spec") or ""
-    # 任务书里出现过的命令名（任意 verb_noun 形态，不限白名单）
-    for m in re.finditer(
-            r"\b((?:set|load|present|insert|examine|rpt|dump|add|remove|check|"
-            r"report|write|read|trim)_[a-z0-9_]+)\b", spec):
-        query_parts.append(m.group(1))
-
-    # 决策阶段必然要碰的语义簇
-    query_parts.append("set_scan_cfg chain_count max_length mix_clocks mix_edges")
-    query_parts.append("internal_clocks lockup latch add_lockup insert_terminal_lockup")
-
-    u = understanding or {}
-    if u.get("clock_signals"):
-        query_parts.append("set_scan_signal clock associated_internal_clocks pseudo_pi")
-    if u.get("scan_enable_signals"):
-        query_parts.append("set_scan_signal scan_enable usage")
-    if u.get("scan_cell_mappings") or (
-            (facts or {}).get("dff_types") and not (facts or {}).get("sff_types")):
-        query_parts.append("set_scan_cell_mapping DFF SFF 映射")
-
-    # 单时钟域判定是本 case 的高频考点，显式补一条
-    if re.search(r"单时钟|唯一时钟|只有一个时钟|仅一路时钟|single clock", spec, re.I):
-        query_parts.append("单时钟域 多时钟域 扫描链 配置差异")
-
-    if not query_parts:
-        return ""
-    try:
-        import manual_rag
-        return manual_rag.search_manual(" ".join(sorted(set(query_parts))))
-    except Exception:                                       # noqa: BLE001
-        return ""
-
-
-def build_plan_prompt(task, understanding, facts=None, mode=None):
-    """
-    构造「决策」的 prompt。
-
-    【两种模式，2026-10-28】
-    `review`（旧）：把规则草稿摆出来，只问「哪里不符」，模型从「生成题」变成
-    「校对题」，省时间。但它有个结构性问题：LLM 只在规则没想到的地方发言，
-    规则没想到的字段 LLM 也不会主动补 —— 于是整个系统实质是规则引擎加装饰。
-    赛题是「基于大语言模型的智能体」，主路径必须是 LLM 决策。
-
-    `author`（新，默认）：LLM 依据任务书 + 网表事实 + **手册检索**自己出完整决策；
-    规则草稿降级为「参考草稿」摆在同一份 prompt 里，供模型交叉验证。
-    规则层的职责剩下三件：校验（端口真实性）、纠正（把不合规取值修好而不是丢弃）、
-    渲染（把 JSON 落成合法 Tcl）。失败时才整段回退草稿，保证不空跑。
-    """
-    mode = (mode or PLAN_MODE or "author").strip().lower()
-    f = facts or {}
-    ports = f.get("top_ports") or {}
-    facts_lines = [
-        f"- 顶层模块: {f.get('top', task.get('top_module', '?'))}",
-        f"- 顶层端口: {', '.join(sorted(ports)) if ports else '（未解析）'}",
-    ]
-    if f.get("dff_types"):
-        facts_lines.append("- DFF 单元: " + ", ".join(
-            f"{k}×{v}" for k, v in list(f["dff_types"].items())[:6]))
-    if f.get("dff_types") is not None and not f.get("sff_types"):
-        facts_lines.append("- 网表里没有现成 SFF 单元 → 需要 set_scan_cell_mapping 做映射")
-    icg = f.get("icg") or {}
-    has_icg = bool(icg.get("cells") or icg.get("floating_clk")
-                   or icg.get("floating_clock_roots"))
-    if has_icg:
-        facts_lines.append("- 网表含时钟门控单元(ICG) → scan_enable 必须用 -usage all，"
-                           "否则 ICG 在扫描态被关断（DFTR9）")
-    clk_leaves = f.get("clock_leaf_nets") or []
-    if clk_leaves:
-        facts_lines.append(f"- 顶层时钟派生出的叶子时钟网络 {len(clk_leaves)} 个"
-                           f"（超过 1 个即存在内部时钟域）")
-    if f.get("clock_inverted"):
-        facts_lines.append("- 存在经反相器派生的时钟（上升沿/下降沿混用）")
-    facts_text = "\n".join(facts_lines)
-
-    draft = {k: understanding.get(k) for k in
-             ("top_module", "workflow", "clock_signals", "reset_signals",
-              "scan_enable_signals", "constant_signals", "scan_cell_mappings", "scan_cfg")
-             if understanding.get(k) not in (None, "", [], {})}
-
-    fields_text = """字段取值范围：
-  "workflow": ["full_scan"] 或 ["connect_icg_only","replace_only","replace_unscan"]
-  "clock_signals": [{{"port":"<顶层端口>","off_state":0}}]
-  "reset_signals": [{{"port":"<顶层端口>","off_state":0}}]
-  "scan_enable_signals": [{{"port":"<顶层端口>","usage":"all|clock_gating|scan"}}]
-  "constant_signals": [{{"port":"<顶层端口>","value":1}}]
-  "scan_cell_mappings": [["<dff_cell>","<sff_cell>"]]
-  "scan_cfg": {{"chain_count":2,"max_length":500,"mix_clocks":false,"mix_edges":false,
-                "internal_clocks":"none|single|multi","add_lockup":true,
-                "insert_terminal_lockup":true,"replace":true,
-                "respect_sff_se_connection":true}}
-  "drc_rules": ["DFTR10"]"""
-
-    # 手册检索结果：决策阶段的**主要依据**。下面那几条要点的定位随之降级为
-    # 「已知的坑，先提醒一句」，不再冒充手册 —— 手册说了算，没覆盖到的由模型
-    # 依据原文自己判断。检索失败时返回空串，prompt 里如实写「未检索到」。
-    manual_text = _plan_manual_context(task, understanding, facts)
-
-    rules_text = """需要特别核对的点（与手册片段冲突时以手册为准）：
-1. 任务书只要求前置处理 / 明确说不建链 → workflow 应为三步；要求插链 → ["full_scan"]。
-2. set_scan_signal 只能写顶层端口；内部信号/引脚名不能当端口（除非任务书明确要求新建）。
-3. 任务书给出了 DFF→SFF 对照表、或明确要求新建端口 → 必须补上。
-4. chain_count / max_length 以任务书原文为准。
-5. 任务书要求豁免某类 DRC → 写进 drc_rules。
-6. scan_cfg 的时钟/边沿/内部时钟/lockup 类选项要从**任务书语义 + 手册**推导，
-   不要套默认值。单时钟域与多时钟域在 mix_clocks、add_lockup、insert_terminal_lockup
-   上的正确取值不同，先在手册片段里核对，再下结论。
-   **但任务书没提的选项不要自行补**：尤其是 mix_edges —— 只有任务书明确谈到
-   边沿策略（"禁止混沿"/"允许正负沿混合"）才填，没提就省略。
-7. **reset_signals 默认不该填**：任务书里的「复位信号」列表通常是设计结构介绍，
-   不是配置要求。只有任务书明确要求把某端口配置为扫描复位时才填。
-8. **scan_enable 的 usage 默认不写**：只有任务书明确指定用途（时钟门控 /
-   扫描与时钟门控并用）才填。不要因为有 ICG 就自行补 all。
-9. off_state 只在任务书**显式给出**关闭电平（如「关闭状态为 0」「低有效」）时才写，
-   没写就不要补 0。"""
-
-    if mode == "review":
-        return f"""# 任务说明书
-{task.get('task_spec', '')}
-
-# 系统限制
-{task.get('limitations', '')}
-
-# 网表事实（确定性解析，可直接引用真实名字）
-{facts_text}
-
-# 手册片段（dftexp_scan 官方手册检索结果）
-{manual_text or '（本次未检索到相关段落，请依任务书原文判断）'}
-
-# 当前草稿（确定性抽取，多数情况下已经正确）
-{json.dumps(draft, ensure_ascii=False, indent=1)}
-
-# 你的任务
-对照任务说明书**逐项核对**上面的草稿，只指出**需要修改**的地方。
-- 草稿正确的字段，不要重复输出；
-- 如果全部正确，只输出 `{{}}`；
-- 需要修改时，只输出要改的字段（整字段覆盖，不是增量）。
-
-{fields_text}
-
-{rules_text}"""
-
-    return f"""# 任务说明书
-{task.get('task_spec', '')}
-
-# 系统限制
-{task.get('limitations', '')}
-
-# 网表事实（确定性解析，可直接引用真实名字）
-{facts_text}
-
-# 手册片段（dftexp_scan 官方手册检索结果，命令语义与选项含义以此为准）
-{manual_text or '（本次未检索到相关段落，请依任务书原文判断）'}
-
-# 参考草稿（由规则从任务书中机械抽取，可能不完整、也可能误读语义）
-{json.dumps(draft, ensure_ascii=False, indent=1)}
-
-# 你的任务
-阅读任务说明书与手册片段，**独立做出本 case 的完整配置决策**，输出完整 JSON。
-- 所有你需要生效的字段都要写出来 —— 这不是差值，不会与草稿自动合并。
-- 参考草稿只用于交叉验证：它对了就沿用，它漏了就补，它与任务书冲突就以任务书为准。
-- 手册片段与你的印象冲突时，**以手册片段为准**。
-- 任务书没提到的可选项，**省略该字段**，不要猜默认值。
-
-{fields_text}
-
-{rules_text}"""
-
-
-
-def _sanitize_plan(plan, task=None, facts=None):
-    """校验并**纠正** LLM 计划。
-
-    定位（2026-10-28 起）：这是「规则校」那一半。原则是**能修就修，修不了才丢**——
-    旧实现一律 `continue` 丢弃，等于把 LLM 的判断直接抹掉，系统又退回规则模板。
-    现在：
-      · 端口名做了大小写/空白归一后再判存在性，命中就保留；
-      · 布尔类取值接受 "true"/"是"/1 等写法，归一成真正的 bool；
-      · 只对「确实不可能是这个 case 的配置」才丢弃（不存在的内部信号当端口、
-        结构上无法渲染的字典/列表），并在日志里写明丢弃原因。
-    """
-    if not isinstance(plan, dict):
-        return None
-    out, dropped, fixed = {}, [], []
-    ports = (facts or {}).get("top_ports") or {}
-    port_set = {str(p).strip().lower() for p in ports}
-
-    wf = plan.get("workflow")
-    if isinstance(wf, list):
-        steps = [str(s).strip() for s in wf if str(s).strip() in _WF_STEPS]
-        if steps:
-            out["workflow"] = steps
-        elif wf:
-            dropped.append(f"workflow={wf}")
-
-    def _port_list(key, extra_ok=()):
-        val = plan.get(key)
-        if not isinstance(val, list):
-            return
-        keep = []
-        for item in val:
-            if not isinstance(item, dict):
-                continue
-            raw_name = str(item.get("port") or "").strip()
-            if not raw_name:
-                continue
-            pname = raw_name
-            # 纠正：大小写不一致就换成网表里的真实写法（模型常把 clk_50m 写成 CLK_50M）
-            if port_set and pname.lower() in port_set and pname not in ports:
-                pname = next((p for p in ports if p.lower() == pname.lower()), pname)
-                fixed.append(f"{key}:{raw_name}->{pname}")
-            item = dict(item, port=pname)
-            # 纠正：布尔字符串归一
-            for bk in ("off_state", "value"):
-                if bk in item:
-                    v = item[bk]
-                    if isinstance(v, str):
-                        lv = v.strip().lower()
-                        if lv in ("", "null", "none", "n/a", "?"):
-                            item.pop(bk, None)
-                        elif lv in ("0", "false", "no", "低", "低有效"):
-                            item[bk] = 0
-                        elif lv in ("1", "true", "yes", "高", "高有效"):
-                            item[bk] = 1
-            # 端口校验：facts 有端口清单时必须命中，防止模型把内部信号/引脚名
-            # 当成 set_scan_signal -port（这是历史上最常见的误判）。
-            # 例外：任务说明书原文点名了这个名字 —— 那可能是要求**新建**端口
-            # （task_2/case6 的 test_se 就是这种），不能按「端口不存在」丢掉。
-            spec = (task or {}).get("task_spec", "") or ""
-            # 只有任务书**明确要求新建**这个端口时才补 add_port。
-            # 依据（2026-10-28，public/task_1/case2）：任务书提到了 se_rx_fifo 等
-            # 4 个端口，但网表里没有、官方 golden 也**不写 add_port** —— 工具对
-            # 缺失端口只给 [WARNING] SCAN-4610（不是 ERROR，不中断流程）。
-            # 真正的"新建端口"场景（t2/picorv32）任务书会写「新建端口 test_se」。
-            near = re.search(re.escape(pname) + r".{0,20}?(新建|新增|创建)|(新建|新增|创建).{0,20}?" + re.escape(pname), spec) if pname else None
-            # 任务书如果说「由工具自动创建端口」，那就不该我们补 add_port
-            # （public/task_1/case2 第 143 行就是这么写的，golden 里也没有 add_port）。
-            auto_created = bool(re.search(r"自动创建[^\n]{0,12}端口|端口[^\n]{0,12}自动创建", spec))
-            named_in_spec = bool(near) and not auto_created
-            if ports and pname not in ports and pname not in extra_ok and not named_in_spec:
-                dropped.append(f"{key}:{pname}")
-                continue
-            keep.append(item)
-        if keep:
-            out[key] = keep
-
-    _port_list("clock_signals")
-    _port_list("reset_signals")
-    _port_list("scan_enable_signals")
-    _port_list("constant_signals")
-
-    # scan_enable 的 usage：**有据才留**。
-    #
-    # 模型有很强的「有 ICG 就给 all」先验，即使 prompt 明说默认不写也照填
-    # （2026-10-28 实测 t1/case3/case5：golden 不写或写 clock_gating，我们都出 all）。
-    # 多写一个 -usage 会改变工具行为，不属于「写法差异」，所以在这里按任务书
-    # 依据做一次裁剪 —— 这是规则层该干的「校」，不是替模型做决定：
-    # 任务书确实提到了该端口的用途，就保留模型的判断；完全没提，才删掉。
-    se_list = out.get("scan_enable_signals")
-    if isinstance(se_list, list):
-        spec_all = (task or {}).get("task_spec", "") or ""
-        kept = []
-        for item in se_list:
-            if isinstance(item, dict) and "usage" in item:
-                port = str(item.get("port") or "")
-                near = ""
-                if port:
-                    m = re.search(re.escape(port) + r"[^\n]{0,60}", spec_all)
-                    if m:
-                        near = m.group(0)
-                mentions_gating = bool(re.search(
-                    r"ICG|门控|clock\s*gating|clock_gating", near, re.I))
-                mentions_scan = bool(re.search(r"扫描|shift|capture|scan", near, re.I))
-                if not (mentions_gating or mentions_scan):
-                    item = dict(item)
-                    item.pop("usage", None)
-                    fixed.append(f"{port}.usage(无据已删)")
-            kept.append(item)
-        out["scan_enable_signals"] = kept
-
-    maps = plan.get("scan_cell_mappings")
-    if isinstance(maps, list):
-        pairs = [[str(a), str(b)] for a, b in
-                 (m for m in maps if isinstance(m, (list, tuple)) and len(m) == 2)]
-        if pairs:
-            out["scan_cell_mappings"] = pairs
-
-    # scan_segments：**有据才留**。
-    #
-    # 依据（2026-10-30，t1/case2）：任务书一个字没提 scan segment，模型自己编了
-    # 7 条 `set_scan_segment`；golden 一条都没有。段的作用是「这段寄存器不许拆」，
-    # 随手加会把链结构整个改掉（而且 si/se/so 路径也是编的）。
-    segs = plan.get("scan_segments")
-    if segs:
-        if wants_scan_segments(task or {}, {"scan_segments": segs} if segs else None):
-            out["scan_segments"] = segs
-        else:
-            dropped.append(f"scan_segments×{len(segs) if isinstance(segs, list) else 1}")
-
-    cfg = plan.get("scan_cfg")
-    if isinstance(cfg, dict):
-        # 允许的 scan_cfg 键（手册 2.1.2.4 / 2.2.x）。insert_terminal_lockup 与
-        # replace / respect_sff_se_connection 是 2026-10-28 补的：任务书要求
-        # 「插入 lockup latch」而设计是单时钟域时，唯一的落点就是链尾 lockup。
-        allow = ("chain_count", "max_length", "mix_clocks", "mix_edges",
-                 "internal_clocks", "add_lockup", "insert_terminal_lockup",
-                 "replace", "respect_sff_se_connection",
-                 "si_port_format", "so_port_format")
-        # 这些键的取值是布尔（渲染成 -mix_clocks true/false）
-        bool_keys = ("mix_clocks", "mix_edges", "add_lockup",
-                     "insert_terminal_lockup", "replace", "respect_sff_se_connection")
-        keep = {}
-        for k in allow:
-            if k not in cfg:
-                continue
-            v = cfg[k]
-            if k in bool_keys and isinstance(v, str):
-                lv = v.strip().lower()
-                if lv in ("true", "yes", "1", "是", "开"):
-                    v = True
-                    fixed.append(f"scan_cfg.{k}->true")
-                elif lv in ("false", "no", "0", "否", "关"):
-                    v = False
-                    fixed.append(f"scan_cfg.{k}->false")
-            # 只接受能直接落成 Tcl 标量的值。字典/列表（如按分区给的
-            # {"rx_fifo_partition": 2, ...}）在这个渲染器里表达不出来，
-            # 硬写就是 `-chain_count {'a': 2}` 这种非法 Tcl（t1/c2 实测链数 10→3）。
-            if tcl_scalar(v) is None:
-                dropped.append(f"scan_cfg.{k}={type(v).__name__}")
-                continue
-            keep[k] = v
-        if keep:
-            out["scan_cfg"] = keep
-
-    rules = plan.get("drc_rules")
-    if isinstance(rules, list):
-        keep = [str(r).strip() for r in rules if str(r).strip()]
-        if keep:
-            out["drc_rules"] = keep
-
-    if fixed:
-        print(f"  · 计划取值已纠正 {len(fixed)} 项：{', '.join(fixed[:6])}",
-              file=sys.stderr)
-    if dropped:
-        print(f"  ⚠ 计划里丢弃了 {len(dropped)} 项不合规取值：{', '.join(dropped[:6])}",
-              file=sys.stderr)
-    return out or None
-
-
-def plan_suspicions(plan, understanding, task, facts=None):
-    """
-    规则层的**一致性校验**：只挑疑点，不下结论。
-
-    定位（2026-10-28，按「规则挑毛病、LLM 决策」分工）：
-    规则不去替 LLM 补字段 —— 如果能补，说明规则本来就能独立判断，系统又退回
-    规则主导。规则真正擅长的是**找矛盾**：拿任务书原文与 LLM 的决策对撞，
-    发现「这里可能不对」时把球踢回给 LLM，让它开思考重判一次。
-
-    这样做的成本结构很划算：
-      · 大多数 case 关思考 7s 就给出正确决策，规则核对无异常，直接用；
-      · 少数可疑 case 才开思考 60s 复核 —— 钱花在真正需要的地方，
-        而不是像「全开思考」那样每个 case 都付 60s。
-
-    返回疑点描述列表（空列表 = 未发现矛盾）。
-    """
-    out = []
-    spec = (task or {}).get("task_spec") or ""
-    f = facts or {}
-    plan = plan or {}
-    # review 模式下 plan 是**差值**，很多字段它不会重复输出。所以疑点判断
-    # 一律看「合并后的最终结果」，否则会把「草稿里有、差值里没重复」误判成缺失
-    # （2026-10-28 t1/case1 实测：草稿明明有 workflow，疑点却报"决策里没有 workflow"）。
-    effective = apply_plan(plan, understanding, task, facts) if PLAN_MODE == "review" else plan
-    cfg = effective.get("scan_cfg") or {}
-
-    # ---- 1. 任务书明确要求、却没给的东西 ------------------------------------
-    if re.search(r"插入\s*lockup|lockup\s*latch|锁存", spec, re.I):
-        if "add_lockup" not in cfg and "insert_terminal_lockup" not in cfg:
-            out.append("任务书提到 lockup，但决策里 add_lockup / insert_terminal_lockup 都没给")
-
-    if re.search(r"(DFF|触发器)[^\n]{0,30}(映射|对应|替换为)[^\n]{0,20}SFF|SFF[^\n]{0,20}映射", spec, re.I):
-        if not effective.get("scan_cell_mappings"):
-            out.append("任务书给了 DFF→SFF 映射要求，但决策里 scan_cell_mappings 为空")
-
-    # ---- 2. 单/多时钟域判定与取值冲突 --------------------------------------
-    clocks = effective.get("clock_signals") or []
-    leaves = f.get("clock_leaf_nets") or []
-    single_domain = bool(re.search(
-        r"单时钟域|唯一时钟|只有一个时钟|仅一路时钟|single clock", spec, re.I))
-    # 只看**顶层**时钟数量：串了 associated_internal_clocks 的条目仍算一个时钟域
-    top_clocks = [c for c in clocks if isinstance(c, dict)]
-    if single_domain and len(top_clocks) > 1:
-        out.append(f"任务书称单时钟域，但决策声明了 {len(top_clocks)} 个扫描时钟")
-    # 网表事实：一个顶层时钟派生出多个叶子网络 → 存在内部时钟域，
-    # 此时 internal_clocks 应有取值（none 也可，但必须是有意识的判断）
-    if len(leaves) > 1 and "internal_clocks" not in cfg:
-        out.append(f"网表显示时钟派生出 {len(leaves)} 个叶子网络，但未给出 internal_clocks")
-    if single_domain and cfg.get("mix_clocks") is True:
-        out.append("任务书称单时钟域，却给了 mix_clocks=true（无第二路时钟可混）")
-
-    # ---- 3. 边沿语义冲突 ---------------------------------------------------
-    # 只在任务书**明确**给了边沿策略时才核对，避免对"没提边沿"的 case 乱报。
-    if re.search(r"禁止.{0,4}混沿|不得混沿", spec):
-        if cfg.get("mix_edges") is True:
-            out.append("任务书禁止混沿，但给了 mix_edges=true")
-
-    # ---- 4. 端口真实性（这里只提示，真正丢弃在 _sanitize_plan）------------
-    ports = f.get("top_ports") or {}
-    if ports:
-        for key in ("clock_signals", "reset_signals", "scan_enable_signals"):
-            for item in effective.get(key) or []:
-                p = str((item or {}).get("port") or "")
-                if p and p not in ports and p not in spec:
-                    out.append(f"{key} 的端口 {p} 既不在网表也不在任务书里")
-
-    # ---- 5. 结构完整性（用上面算好的 effective，合并后视图）----------------
-    if not effective.get("workflow"):
-        out.append("决策里没有 workflow")
-    if not (effective.get("clock_signals") or []) and re.search(
-            r"扫描链|scan chain|插链", spec, re.I):
-        out.append("任务书要求建链，但决策里没有扫描时钟")
-
-    return out
-
-
-def plan_with_llm(task, understanding, llm, facts=None, max_tokens=8000):
-    """让 LLM 出「计划 JSON」，返回过滤后的 dict 或 None。
-
-    max_tokens 取 8000 而非 4000：对推理模型，思考 token 也计入这个闸门，
-    4000 会在「想完但还没开始写 JSON」时被截断成空（实测 4000 -> 正文 0 字符）。
-
-    【两段式：快档决策 → 疑点复核】
-    1. 先关思考跑一次（实测 6~7s），拿到第一版决策；
-    2. 规则做一致性校验（`plan_suspicions`），没有疑点就直接用；
-    3. 有疑点且预算允许，**开思考带疑点重跑一次**（60s），让模型针对性复核。
-    这样既保住「每个 case 都真走 LLM 决策」，又不会让每个 case 都付 60s 代价。
-    """
-    if not llm or not getattr(llm, "available", False):
-        return None
-    prompt = build_plan_prompt(task, understanding, facts)
-    # 计划阶段**关思考**：这是「在已知字段清单里填值」的填空题，不是解答题。
-    # 实测开思考 62.9~68.0s / 关思考 6.4~7.4s，质量差异不足以抵消 10 倍耗时。
-    raw = llm.chat_json(plan_system_prompt(), prompt, max_tokens=max_tokens,
-                        thinking=False)
-    if raw is None:
-        return None            # 调用失败/无返回 —— 交回规则路径
-    if raw == {}:
-        if PLAN_MODE == "review":
-            return {}          # review 模式：核对通过，草稿无需修改（成功）
-        # author 模式：空 JSON 表示没决策出任何东西 —— 不能当成功，
-        # 否则等于「LLM 一句话都没说，系统照样按规则草稿跑」。
-        print("  ⚠ LLM 未产出任何决策字段，回退规则草稿", file=sys.stderr)
-        return None
-    plan = _sanitize_plan(raw, task, facts)
-    if plan is None:
-        return None
-
-    # ---- 疑点复核：只在发现矛盾时才追加一次调用 ------------------------------
-    doubts = plan_suspicions(plan, understanding, task, facts)
-    if not doubts:
-        return plan
-    print(f"  · 规则校验发现 {len(doubts)} 处疑点：{doubts[0]}"
-          + (f" 等 {len(doubts)} 项" if len(doubts) > 1 else ""), file=sys.stderr)
-
-    # 复核的思考档位：**默认关思考**。
-    # 评分维度含 token 消耗 —— 开思考实测 reasoning 2707 tokens，关思考正文
-    # 仅数百；复核是在已知字段清单上针对疑点做判断，属于填空题而非解答题，
-    # 没必要为每次疑点都付一份完整推理的开销。
-    # 需要更强推理时用 SCAN_AGENT_PLAN_REVIEW_THINKING=1 打开。
-    _review_think = os.environ.get("SCAN_AGENT_PLAN_REVIEW_THINKING", "0") == "1"
-    min_left = _PLAN_REVIEW_MIN_S if _review_think else _PLAN_REVIEW_FAST_MIN_S
-    left = llm.time_left() if hasattr(llm, "time_left") else None
-    if left is not None and left < min_left:
-        print(f"  · 剩余 {left:.0f}s 不足以复核（需 {min_left:.0f}s），"
-              f"保留原决策", file=sys.stderr)
-        return plan
-
-    doubt_text = "\n".join(f"  {i+1}) {d}" for i, d in enumerate(doubts))
-    if PLAN_MODE == "review":
-        revise_task = """针对上面的疑点逐条核对任务书与手册片段，输出**需要修改的字段**。
-- 疑点成立 → 给出该字段的修正值；
-- 疑点不成立（你原本就是对的）→ 不要输出该字段；
-- 与疑点无关的字段一律不要输出；
-- 若全部疑点都不成立，输出 `{}`。
-- 只输出 JSON。"""
-    else:
-        revise_task = """针对上面的疑点逐条核对任务书与手册片段，输出**修正后的完整决策 JSON**。
-- 疑点成立 → 改；疑点不成立（你原本就是对的）→ 保持原值；
-- 没有疑点涉及的字段，原样保留；
-- 只输出 JSON。"""
-    review_prompt = f"""{prompt}
-
-# 规则校验器对你上一版决策提出的疑点
-{doubt_text}
-
-# 你上一版决策
-{json.dumps(plan, ensure_ascii=False, indent=1)}
-
-# 请你重新判断
-{revise_task}"""
-    # 开思考时 reasoning token 与正文共用闸门，需放大上限（见 input_parser）。
-    _cap = max(int(max_tokens), 30000) if _review_think else max_tokens
-    raw2 = llm.chat_json(plan_system_prompt(), review_prompt,
-                         max_tokens=_cap, thinking=_review_think)
-    if raw2 is None:
-        print("  · 复核未返回有效结果，保留原决策", file=sys.stderr)
-        return plan
-    if raw2 == {} and PLAN_MODE == "review":
-        print("  ✓ 复核：全部疑点不成立，维持原决策")
-        return plan
-    plan2 = _sanitize_plan(raw2, task, facts)
-    if plan2 is None:
-        return plan
-    print(f"  ✓ 疑点复核完成（{'开思考' if _review_think else '快档'}），"
-          f"疑点 {len(doubts)} 处")
-    return plan2
-
-
-def _merge_by_port(draft, patch):
-    """
-    按 port 名做**逐项合并**：patch 里提到的端口覆盖对应字段，未提到的保留。
-
-    为什么不能整体替换（2026-10-28，public/task_1/case5 实测）：
-    计划 prompt 要求「只输出需要修改的字段」，模型于是只回了 2 个顶层时钟；
-    而旧实现 `merged[key] = plan[key]` 直接整体替换 → 9 条内部时钟
-    （pseudo PI）和 `associated_internal_clocks` 全丢，与 golden 的差异从 1 处
-    变成 3 处，且丢的正好是造成 DFTR1×69022 的那批声明。
-    「只报差异」的 prompt 必须配「按项合并」的实现，否则每轮都在悄悄删配置。
-    """
-    out = [dict(x) for x in (draft or []) if isinstance(x, dict)]
-    index = {x.get("port"): i for i, x in enumerate(out)}
-    for item in patch or []:
-        if not isinstance(item, dict):
-            continue
-        port = item.get("port")
-        if port in index:
-            merged_item = dict(out[index[port]])
-            merged_item.update(item)          # 只覆盖它明确给了的键
-            out[index[port]] = merged_item
-        else:
-            out.append(dict(item))
-    return out
-
-
-def apply_plan(plan, understanding, task=None, facts=None, mode=None):
-    """
-    把 LLM 计划合成最终 understanding。
-
-    两种模式的语义**不同**，必须分开处理：
-
-    `review`（旧）：计划是**差值**。列表类按 port 逐项合并、scan_cfg 按键合并，
-      未提到的保留草稿值 —— 因为 prompt 只让模型报差异，整体替换会把没报的
-      配置全删掉（t1/case5 实测：9 条内部时钟丢失，DFTR1×69022）。
-
-    `author`（新，默认）：计划是**完整决策**。LLM 说了什么就是什么，草稿只在
-      LLM 完全没提的字段上补位。所以这里做的是「以 plan 为主、understanding
-      补空」，而不是 merge。
-
-    无论哪种模式，规则层的纠正（端口真实性、取值合法性）已在 `_sanitize_plan`
-    里做完 —— 这里是纯装配。
-    """
-    mode = (mode or PLAN_MODE or "author").strip().lower()
-    merged = copy.deepcopy(understanding or {})
-
-    if mode == "author":
-        # 完整决策：plan 有的字段整体取代草稿；plan 没决策的字段才留草稿。
-        for key in _PLAN_FIELDS:
-            val = plan.get(key)
-            if val in (None, "", [], {}):
-                continue
-            if key == "scan_cfg":
-                # scan_cfg 例外：**按选项键合并**，plan 优先。
-                #
-                # 为什么不能整体替换（2026-10-28 实测 t1/case6）：
-                # 理解阶段已从任务书推出 mix_edges=true（"单一正沿设计"），
-                # 但计划阶段没重复这条 → 整体替换把理解层的正确判断抹掉，
-                # 最终 dofile 里少了 -mix_edges，与 golden 差 1 处。
-                # scan_cfg 的每一项都是独立开关，天然适合按键合并；
-                # 而且「删除某个选项」在这套渲染里等价于「不写」，没有语义损失。
-                cfg = dict(merged.get(key) or {})
-                cfg.update(val or {})
-                merged[key] = cfg
-                continue
-            if key == "wrapper_cfg":
-                # wrapper_cfg 同理不能整体替换：草案里的「按端口策略」（key1→none、
-                # key2→dedicated）是说明书里的验收项，模型漏写就整段丢了。
-                merged[key] = _merge_wrapper_cfg(merged.get(key), val)
-                continue
-            merged[key] = val
-        reconcile_wrapper_cfg(merged, task, facts)
-        return merged
-
-    for key in _PLAN_FIELDS:
-        if key not in plan:
-            continue
-        if key in ("clock_signals", "reset_signals",
-                   "scan_enable_signals", "constant_signals"):
-            merged[key] = _merge_by_port(merged.get(key), plan[key])
-        elif key == "scan_cell_mappings":
-            # **规则优先，且以网表事实为准**：
-            #   · 合并后的 understanding 里已有映射 → 直接用，不让计划扩；
-            #   · 网表里已经存在 SFF 单元 → 根本不需要映射，一律不采纳计划的。
-            # 依据（2026-10-28 t1/case4）：该设计网表里已有 255 个 SFF
-            # （sdfrtp_1×71、sdlclkp_1×224 …），golden 一对映射都没有；
-            # 模型却按「DFF 叫 dfrtp_1、SFF 应该叫 sdfrtp_1」的命名规律推了 5 对。
-            # 多出来的映射会让工具去替换本不该动的单元 —— 结构性错误。
-            if merged.get(key):
-                continue
-            if (facts or {}).get("sff_types"):
-                continue
-            pairs = {tuple(p) for p in (plan[key] or []) if len(p) == 2}
-            merged[key] = [list(p) for p in sorted(pairs)]
-        elif key == "scan_cfg":
-            cfg = dict(merged.get(key) or {})
-            for k, v in (plan[key] or {}).items():
-                # chain_count / max_length 是任务书里**逐字给出**的数字，
-                # 规则的正则匹配比模型可靠：实测 t1/case3 任务书写 70，
-                # 模型回了 55，把本来正确的配置改坏。
-                # 只有草稿里没有该值时才采纳模型给的数。
-                if k in _SPEC_NUMERIC_CFG and cfg.get(k) not in (None, ""):
-                    if cfg.get(k) != v:
-                        print(f"  · 保留规则值 scan_cfg.{k}={cfg.get(k)}"
-                              f"（模型给 {v}，任务书原文优先）", file=sys.stderr)
-                    continue
-                cfg[k] = v
-            merged[key] = cfg
-        elif key == "wrapper_cfg":
-            # review 模式同样是「只报差值」的语义：模型没重复报的项必须留住，
-            # 否则 key1→none / key2→dedicated 这类验收项会被一次复盘抹掉。
-            merged[key] = _merge_wrapper_cfg(merged.get(key), plan[key])
-        else:
-            merged[key] = plan[key]
-    reconcile_wrapper_cfg(merged, task, facts)
-    return merged
-
-
-def _merge_wrapper_cfg(draft, patch):
-    """
-    wrapper_cfg 的按项合并（plan 优先，但草案里的端口策略要留住）。
-
-    为什么不能 `merged[key] = plan[key]`（2026-10-30 实测 t1/case6）：
-    规则层已经从说明书推出 `key1→none`、`key2→dedicated user_defined`，
-    但计划阶段只要没重复这两条，整体替换就把它们删干净了 —— 而这两条正是
-    task_spec 的验收项（"key1 不参与扫描路径" / "key2 必须用 dedicated wrapper cell"）。
-    """
-    out = dict(draft or {})
-    for k, v in (patch or {}).items():
-        # null / 空值不覆盖：模型经常把没想好的字段显式写成 null，
-        # 覆盖上去就会渲染出 `-style None` 这种非法值（见 _wrapper_style 注释）。
-        if v is None or v == "" or v == [] or v == {}:
-            continue
-        if k == "port_specific":
-            out[k] = _merge_by_port(out.get(k), v)
-        elif k in ("enabled_signals",) and isinstance(v, dict):
-            d = dict(out.get(k) or {})
-            d.update(v)
-            out[k] = d
-        else:
-            out[k] = v
-    return out
-
-
 def generate_dofile_with_llm(task, understanding, llm, num_candidates=None, facts=None):
-    """
-    LLM 决策 + 代码渲染（R22 默认路径）。
-
-    与旧实现（`_generate_dofile_full_with_llm`，LLM 直出整份 dofile）的区别：
-      · 模型输出从「几十~几百行 Tcl」降到「一个 JSON」，思考量随之骤降
-        （实测 260s -> 39s），才装得下 120s 的预运行窗口；
-      · 命令拼装交给 `generate_from_config`，命令名必然合法、路径与产物自动补齐；
-      · 计划里的端口会按网表顶层端口校验，模型写内部信号会被丢弃。
-
-    Returns:
-        str: 渲染出的 dofile；LLM 不可用或没给出可用计划时返回 None。
-    """
-    mode = (os.environ.get("SCAN_AGENT_LLM_MODE") or "plan").strip().lower()
-    if mode == "full":
-        return _generate_dofile_full_with_llm(task, understanding, llm,
-                                              num_candidates=num_candidates, facts=facts)
-    if not llm or not getattr(llm, "available", False):
-        return None
-
-    t0 = time.time()
-    plan = plan_with_llm(task, understanding, llm, facts)
-    if plan is None:
-        print("  ⚠ LLM 未给出可用结果，改走规则模板", file=sys.stderr)
-        return None
-    if not plan and PLAN_MODE == "review":
-        # review 模式：核对通过、无修改，直接按草稿渲染。这是**成功**。
-        print(f"  ✓ LLM 核对草稿 {time.time() - t0:.0f}s：无需修改")
-
-    merged = apply_plan(plan, understanding, task, facts)
-    dofile = generate_from_config(task, merged, facts=facts)
-    task["_llm_plan"] = plan          # 供 decision_log / 事后复盘
-    print(f"  ✓ LLM 计划 {time.time() - t0:.0f}s（{PLAN_MODE}）：workflow={plan.get('workflow')} "
-          f"clocks={len(plan.get('clock_signals') or [])} "
-          f"se={len(plan.get('scan_enable_signals') or [])} "
-          f"mappings={len(plan.get('scan_cell_mappings') or [])}")
-    return dofile
-
-
-def _generate_dofile_full_with_llm(task, understanding, llm, num_candidates=None, facts=None):
     """
     用 LLM 生成完整 dofile 脚本（支持生成多个候选并择优）。
 
@@ -6705,23 +3032,65 @@ def _generate_dofile_full_with_llm(task, understanding, llm, num_candidates=None
         "reports": [f"{c}:{n}" for c, n in _arts["reports"]],
     }
 
-    system_prompt = """你是 dftexp_scan（Scan Insertion）专家。请依据任务说明书、网表事实与手册片段，
-写出**能直接跑通**的 TCL dofile。
+    system_prompt = """你是广立微 dftexp_scan（Scan Insertion）工具的资深专家，精通其 TCL dofile 编写。
+请根据任务说明书、结构化理解、手册参考段落与命令白名单，生成一个**完整、可直接运行**的 dofile 脚本。
 
-只有五条硬约束（其余都由系统在写盘前自动补齐，不用你操心）：
-1. 命令名与参数形式只能来自「命令白名单」和手册片段。凭印象编造的命令（read_lib / read_netlist /
-   set_clock / write_netlist 等）会让整轮直接失败。
-2. 输入文件用绝对路径：/input/lib/xxx.lib、/input/netlist/xxx.v、/input/ctl/xxx.ctl。
-   输出目录直接用 $out_res_dir / $out_rpt_dir，不要自己定义 script_dir 之类的变量。
-3. 命令顺序按任务说明书来：前置处理用 insert_dft_logic -connect_icg_only / -replace_only；
-   完整插链用 examine_scan_drc → examine_scan_chain → insert_dft_logic。不要自创顺序。
-4. 重复结构用 Tcl for 循环写，不要逐条罗列 —— 逐条写会撑爆输出长度，后半段被截断就全丢了。
-5. 任务说明书里给出的表格（如 DFF→SFF 映射、端口/信号清单）必须逐条写全，不能只写几行举例。
+严格要求：
+1. **命令名必须严格来自下方「命令白名单」或参考 dofile**，严禁使用 read_lib / read_netlist /
+   set_current_design / write_netlist / set_clock / set_reset / connect_icg_only 等
+   通用 EDA 工具命令名（这些在 dftexp_scan 中不存在，会被报 Invalid command name）。
+   命令名与参数形式一律以「命令白名单」与手册参考段落为准。
+2. 路径写法（重要，务必遵守）：
+   - 输入文件（库/网表/CTL）必须用**绝对路径**，即 /input/lib/xxx.lib、/input/netlist/xxx.v、
+     /input/ctl/xxx.ctl（具体文件名以下面"输入文件"清单为准）。
+     **严禁**用 $script_dir/lib/xxx、[file join $script_dir "lib" "xxx"] 这类相对路径！
+     （$script_dir 指向 deliverables/，那里没有 lib/netlist，
+      会报 COM-3301 Failed to open file、CMD-3038 Failed to load lib。
+      所以输入文件必须用绝对路径。）
+   - 输出目录：直接引用 $out_res_dir（网表/CTL/SCANDEF）与 $out_rpt_dir（*.rpt 报告）即可，
+     这两个变量由系统在脚本开头自动补齐（指向本轮 run 目录下的 output/ 与 reports/），
+     不要自己再定义 script_dir / out_res_dir / out_rpt_dir，也不要写成 $script_dir/output。
+3. 只输出 dofile 代码（可含注释），不要 Markdown 代码块，不要解释。
+4. 必须以 exit 结尾。
+5. 工作流命令顺序：前置处理（insert_dft_logic -connect_icg_only → -replace_only → -replace_unscan）
+   或完整插链（examine_scan_drc → examine_scan_chain → insert_dft_logic）。
+6. 不要重复导出生成文件（netlist / ctl / scandef），系统会自动补齐。
+7. 不要生成 rpt_scan_* 报告命令，系统会自动按 task_spec 的输出清单补齐。
+8. 不要生成 dump_ctl / dump_def / dump_scan_def，也不要用 trim_scan_chain，系统会自动补齐。
+   （SCANDEF 有两种官方写法：手册写法 dump_def -section scan_chain -file 与
+     历史写法 dump_scan_def -file，二者等价，由系统按参考文件决定。）
+9. 不要写 set_scan_drc_rule_handling —— DRC 规则豁免由系统按 task_spec 原文自动补齐。
+   若确需书写，规则号只能取手册 2.1.3.3 列出的 DFTR1-DFTR17 / DFTR-TIE0 /
+   DFTR-TIE1 / DFTR-L1 / DFTR-L2，严禁自造（如 DFTR-XXX、TIE1、DFTRx），
+   否则工具报 Invalid DRC ID（DFTDRC-3006 + CMD-0074）。
+10. **重复结构必须用 for 循环生成**：当同一模式要重复多次（例如把 N 条移位链各配成一个
+   scan segment、N 条 set_scan_cell_mapping 等），必须写成 Tcl for 循环，**不得逐条罗列**——
+   逐条罗列会超出单次输出长度上限、脚本被截断，后半段命令（segment / wrapper 注册 /
+   insert_dft_logic）全部丢失。位选下标交给循环变量，路径名一律取下方「网表事实」中给出的
+   真实名字；示例（下标在 Tcl 双引号内需做转义）：
+       for {set i 0} {$i < <条数>} {incr i} {
+           set_scan_segment seg$i -lockup_exists false \\
+               -access [list scan_enable "<事实中的 se 路径>" \\
+                             scan_data_in "<事实中的 si 路径>" \\
+                             scan_data_out "<事实中的 so 路径>"]
+       }
+11. **表格类配置必须逐条写全，一条都不能漏**：task_spec 若给出「DFF→SFF 单元映射表」
+   「端口/信号清单」等表格，表里有多少行就要写出多少条命令 —— 例如
+   set_scan_cell_mapping 必须把每一对 (DFF, SFF) 都写出来，**不得只写一行就交差**。
+   漏写会让插链结果与任务要求不符，属于「DFT 配置不符合任务要求」，会被直接判不满足。
+   所有映射都写在同一个命令族里，直接逐行列出即可（条数一般不多，无需 for 循环）。
 
-导出网表/CTL/SCANDEF、报告命令、exit、DRC 规则豁免都由系统按任务说明书补齐；
-也**不要**自己写 set_scan_drc_rule_handling（规则号写错会报 Invalid DRC ID）。
+【网表事实是最重要的依据】
+下方「网表事实」由确定性解析器从**本 case 的真实网表 + Liberty** 提取。
+凡涉及具体实例名、端口名、网络名、路径（如 set_scan_segment 的 si/se/so、
+add_dedicated_wrapper_cell_type 的接口端口），**必须使用事实中给出的真实名字**，
+不得凭想象编造。事实未覆盖的内容再依据任务说明书与手册推断。
 
-输出：只给 dofile 代码，不要 Markdown 代码块，不要解释。"""
+【严禁脑补】
+- 只配置 task_spec 中明确要求"配置为扫描信号"的端口。
+- 不要把"时钟结构表""复位信号列表"等描述性段落里的信号写进 set_scan_signal。
+- 不要给 set_scan_signal 添加 task_spec 未提及的参数（如 -off_state / -usage）。
+- 严格遵守下方"命令白名单"，不得编造命令名和参数形式。"""
 
     # 命令白名单 prompt 片段
     whitelist_prompt = build_command_whitelist_prompt()
@@ -6829,12 +3198,9 @@ def _fix_hallucinated_commands(dofile_text, violations):
     无法修复的违规命令（行）会保留，交由候选评分过滤。
     """
     lines = dofile_text.splitlines(keepends=True)
-    # 手册截断名（_MANUAL_PARSE_NOISE 里有正确名字的那几个）与幻觉命令同等对待：
-    # 校验环节已经把噪声名剔出 known_commands，这里负责把它们改成真命令。
-    _fixmap = {k: v for k, v in _MANUAL_PARSE_NOISE.items() if v}
     for line_no, cmd in violations:
-        correct = _HALLUCINATED_COMMANDS.get(cmd) or _fixmap.get(cmd)
-        if correct:
+        if cmd in _HALLUCINATED_COMMANDS:
+            correct = _HALLUCINATED_COMMANDS[cmd]
             idx = line_no - 1
             if idx < len(lines):
                 lines[idx] = lines[idx].replace(cmd, correct, 1)
@@ -6935,7 +3301,7 @@ def _retrieve_manual_for_generation(task, understanding):
 
 
 def clean_dofile(content):
-    """清理 LLM 返回内容，剥离 Markdown 代码块标记，并保证以 exit 收尾。"""
+    """清理 LLM 返回内容，剥离 Markdown 代码块标记。"""
     if not content:
         return ""
     content = content.strip()
@@ -6945,13 +3311,7 @@ def clean_dofile(content):
         content = m.group(1)
     if content.endswith("```"):
         content = content[:-3]
-    content = content.strip()
-    # 【代码兜底】以前 prompt 里写着「必须以 exit 结尾」，现在 prompt 已精简，
-    # 这条改由代码保证：缺了就补（幂等，已有 exit 不动）。
-    # 工具脚本没有 exit 时会停在交互态，直到超时才被杀 —— 白烧一整轮时间。
-    if content and content.splitlines()[-1].strip().lower() != "exit":
-        content += "\nexit"
-    return content + "\n"
+    return content.strip() + "\n"
 
 
 # ============================================================================
@@ -6984,52 +3344,6 @@ def _tcl_list_items(inner):
         if val:
             items.append(val)
     return items
-
-
-
-
-_PY_LITERAL_RE = re.compile(r"-[A-Za-z_]\w*\s+\{[^{}]*'[^{}]*:[^{}]*\}")
-
-
-def find_python_literals(dofile_text):
-    """
-    找出「Python 字面量混进 Tcl」的行（如 `-chain_count {'a': 2, 'b': 4}`）。
-
-    为什么要单独检：这类值不是命令名错误（命令白名单查不出来），也不是语法
-    顺序错误，工具只会报一个含糊的参数非法，然后整轮产出错的结果 ——
-    比直接报 ERROR 更难发现（t1/case2 掉了 7 条链却"没有报错"）。
-    """
-    return [(i, line.strip()) for i, line in
-            enumerate((dofile_text or "").splitlines(), 1)
-            if _PY_LITERAL_RE.search(line)]
-
-
-def tcl_scalar(value):
-    """
-    把 Python 值渲染成**合法的 Tcl 标量**；表达不了就返回 None（调用方跳过该选项）。
-
-    为什么必须有（2026-10-27，测试10/task_1/case2 实测）：LLM 计划里把
-    `chain_count` 写成了分区字典 `{"rx_fifo_partition": 2, ...}`，渲染层直接
-    f-string 插值，于是 dofile 里出现
-
-        set_scan_cfg -chain_count {'rx_fifo_partition': 2, 'tx_fifo_partition': 4, ...}
-
-    —— 这不是 Tcl，工具按非法参数处理，链数从 10 条掉到 3 条。DFT 里这类
-    「值不是标量」的情况很常见（分区字典、列表），必须在写盘前挡住。
-
-    规则：bool → true/false；int/float → 原样；str → 原样（去首尾空白）；
-    dict/list/tuple/None/空串 → None（该选项整条不写，由确定性补齐兜）。
-    """
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, str):
-        v = value.strip()
-        return v or None
-    return None
 
 
 def _input_join(input_dir, parts):
@@ -7375,10 +3689,7 @@ def _hard_gaps(dofile_text, task, understanding, facts):
         gaps.append("缺 scan_enable 声明")
     if (u.get("wrapper_cfg") or {}).get("enabled") and "set_wrapper_cfg" not in names:
         gaps.append("缺 wrapper 配置")
-    # 映射只在「仅替换、不插链」的流程才是硬要求（与渲染策略保持一致：
-    # 插链流程里 replace 默认 True，官方 golden 也一律不写映射）。
-    # 旧实现不分流程地要求映射，导致插链 case 的 LLM 候选被误判、回退规则模板。
-    if u.get("scan_cell_mappings") and "full_scan" not in decide_workflow(task, u):
+    if u.get("scan_cell_mappings"):
         n = len(re.findall(r"(?m)^\s*set_scan_cell_mapping\b", text))
         if n < len(u["scan_cell_mappings"]):
             gaps.append(f"DFF→SFF 映射不足（{n}/{len(u['scan_cell_mappings'])}）")
@@ -7492,13 +3803,6 @@ def _generate_dofile_raw(task, understanding, llm, facts=None):
         # 规则模板由 generate_from_config 从命令白名单拼出，命令名必然合法，
         # 因此这里不需要（也不应该）先判断规则模板是否"更干净"才决定回退。
         llm_violations = validate_dofile_commands(llm_dofile)
-        # Python 字面量混进 Tcl（如 `-chain_count {'a': 2}`）：命令名合法、
-        # 也不会报 ERROR，但结果一定是错的 —— 单独拦一次。
-        _py_lits = find_python_literals(llm_dofile)
-        if _py_lits:
-            print(f"  ⚠ LLM 结果含 {len(_py_lits)} 处 Python 字面量（如 {_py_lits[0][1][:60]}），"
-                  f"回退规则模板兜底")
-            return _fallback(f"LLM 结果含 {len(_py_lits)} 处非 Tcl 字面量")
         if llm_violations:
             print(f"  ⚠ LLM 生成 dofile 含 {len(llm_violations)} 个幻觉命令，回退规则模板兜底")
             return _fallback(f"LLM 含 {len(llm_violations)} 个不可修复的幻觉命令")
@@ -7707,69 +4011,3 @@ def place_drc_configs_before_examine(dofile_text):
     pos = next(i for i, l in enumerate(rest) if re.match(r"[ \t]*examine_scan_drc\b", l))
     return "".join(rest[:pos] + cfg_lines + rest[pos:])
 
-
-
-# ============================================================================
-# 最后一道兜底：最小可用 dofile
-# ============================================================================
-
-def minimal_dofile(task, facts=None):
-    """
-    生成一份**一定合法**的最小 dofile（加载 → DRC → 插链 → 导出产物）。
-
-    用途（2026-11-01 新增）：换一个全新 case 时，生成链路上任何一处抛异常
-    （分区表解析、理解合并、LLM 返回残缺、产物清单解析……），都会让整个 case
-    连 dofile 都产不出来 —— 那是 0 分。有了这个函数，最坏情况退化成
-    「链结构可能不是最优，但 DRC / 产物 / 报告齐全」，仍能拿到大部分分项。
-
-    刻意保持极简：不写分区、不写 wrapper、不写 segment、不做映射 —— 这些都需要
-    语义判断，判断不出来就交给工具默认行为，比写错更安全。
-    """
-    task = task or {}
-    facts = facts or {}
-    top = str((facts or {}).get("top") or task.get("top_module") or "")
-    files = task.get("files") or {}
-    input_dir = task.get("input_dir", "")
-
-    lines = build_path_header()
-    lines.append("")
-    lines.append("# ── 兜底模板：生成链路异常时的最小可用流程 ──────────────")
-
-    libs = [abs_input_path(task, p) for p in (files.get("lib") or [])]
-    if libs:
-        q = [tcl_quote(p) for p in libs]
-        lines.append(f"load_lib {q[0]}" if len(q) == 1
-                     else "load_lib [list " + " \\\n               ".join(q) + "]")
-
-    nets = [abs_input_path(task, p) for p in (files.get("netlist") or [])]
-    nets = _order_netlists(nets, top)
-    if nets:
-        q = [tcl_quote(p) for p in nets]
-        lines.append(f"load_netlist {q[0]}" if len(q) == 1
-                     else "load_netlist [list " + " \\\n                   ".join(q) + "]")
-    if top:
-        lines.append(f"present_design {top}")
-    lines.append("")
-
-    # 只给一个宽松的链长上限，其余全用工具默认（链数由工具按 FF 数与上限自定）
-    lines.append("set_scan_cfg -max_length 500")
-    lines.append("")
-    lines.append("examine_scan_drc")
-    lines.append("insert_dft_logic")
-    lines.append("")
-
-    try:
-        arts = required_artifacts(task)
-        lines.extend(report_lines(arts.get("reports") or []))
-        if arts.get("netlist"):
-            lines.append(f'dump_netlist -file "$out_res_dir/{arts["netlist"]}"')
-        if arts.get("ctl"):
-            lines.append(f'dump_ctl "$out_res_dir/{arts["ctl"]}"')
-        if arts.get("scandef"):
-            lines.append(scandef_dump_line(arts["scandef"],
-                                           arts.get("scandef_cmd") or "dump_def"))
-    except Exception:                                        # noqa: BLE001
-        lines.append('dump_netlist -file "$out_res_dir/post_scan.v"')
-    lines.append("")
-    lines.append("exit")
-    return "\n".join(lines) + "\n"

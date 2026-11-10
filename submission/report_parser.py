@@ -179,8 +179,7 @@ def parse_drc_report(text=None, path=None):
 
     解析失败/文件不存在时返回全零结构，不抛异常（判据缺失由调用方决定如何处理）。
     """
-    out = {"total_violations": 0, "rules": {}, "warning_rules": {},
-           "error_rules": {}}
+    out = {"total_violations": 0, "rules": {}}
     lines = []
     if path:
         try:
@@ -204,20 +203,6 @@ def parse_drc_report(text=None, path=None):
         if m:
             cnt, rule = int(m.group(1)), m.group(2).upper()
             out["rules"][rule] = out["rules"].get(rule, 0) + cnt
-        # 官方答疑 Q19：task_2/case2 的 21 条 DFTR10 是允许保留的 Warning，
-        # 不应被当作必须清零的 Error 驱动无效重试。这里只记录明细行的严重级别；
-        # 汇总行的 "fails" 不代表级别，且工具会把同类违例折叠成
-        # "[INFO] There were N other cells with the same violation."，
-        # 因此**明细行条数 != 违例条数**，只能用「是否出现过 WARNING/ERROR
-        # 明细」来判断级别，条数取自汇总行。
-        sev = line.lstrip()
-        if sev.startswith("[WARNING]") or sev.startswith("[ERROR]"):
-            wm = re.search(r"\((DFTR[\w-]*)-\d+\)", line, re.IGNORECASE)
-            if wm:
-                rule = wm.group(1).upper()
-                bucket = ("warning_rules" if sev.startswith("[WARNING]")
-                          else "error_rules")
-                out[bucket][rule] = out[bucket].get(rule, 0) + 1
     if out["total_violations"] == 0 and out["rules"]:
         out["total_violations"] = sum(out["rules"].values())
     return out
@@ -258,8 +243,7 @@ def collect_drc(run_dir=None, parsed=None):
     Returns:
         {"total_violations": int, "rules": {规则号: 条数}, "sources": [文件名]}
     """
-    merged = {"total_violations": 0, "rules": {}, "sources": [],
-              "warning_rules": {}, "error_rules": {}}
+    merged = {"total_violations": 0, "rules": {}, "sources": []}
     for f in find_drc_reports(run_dir):
         one = parse_drc_report(path=str(f))
         if not one["rules"] and not one["total_violations"]:
@@ -267,12 +251,6 @@ def collect_drc(run_dir=None, parsed=None):
         merged["sources"].append(f.name)
         for rule, cnt in one["rules"].items():
             merged["rules"][rule] = merged["rules"].get(rule, 0) + cnt
-        for rule, cnt in (one.get("warning_rules") or {}).items():
-            merged["warning_rules"][rule] = (
-                merged["warning_rules"].get(rule, 0) + cnt)
-        for rule, cnt in (one.get("error_rules") or {}).items():
-            merged["error_rules"][rule] = (
-                merged["error_rules"].get(rule, 0) + cnt)
         merged["total_violations"] = max(merged["total_violations"],
                                          one["total_violations"])
 
@@ -303,28 +281,6 @@ def drc_effective(parsed, allowed_rules=()):
         {"total": int, "by_rule": {...}, "allowed": {...}}
     """
     allowed = {str(r).upper() for r in (allowed_rules or ())}
-    # 仅告警级别的残留：官方 Q&A 明确 task_2/case2 的 21 条 DFTR10 属允许保留。
-    #
-    # 判据（三条同时成立）：
-    #   1) 规则号是 DFTR10（时钟接到单元数据输入，功能结构本身决定的告警，
-    #      不动网表就消不掉；官方 Q19 明确它是 Warning 而非待修违例）；
-    #   2) 该规则**出现过 [WARNING] 明细行**（有工具原文证据，不是我们猜的）；
-    #   3) 该规则**没有出现过 [ERROR] 明细行**。
-    #
-    # 注意不能用「告警明细条数 >= 违例条数」：工具会把同类违例折叠成
-    # "[INFO] There were 20 other cells with the same violation."，
-    # 明细只有 1 行而汇总写 21 条，用条数比会永远不成立。
-    #
-    # 反向约束：DFTR1/DFTR9 在 case6 同样是 [WARNING] 级别，但它们是**待修**
-    # 违例（golden 修完为 0），所以这里只放行 DFTR10，不按级别一刀切。
-    warn = {str(r).upper(): int(n or 0)
-            for r, n in ((parsed or {}).get("drc_warning_rules") or {}).items()}
-    err = {str(r).upper(): int(n or 0)
-           for r, n in ((parsed or {}).get("drc_error_rules") or {}).items()}
-    for rule in (parsed.get("drc_rules") or {}):
-        ru = str(rule).upper()
-        if ru.startswith("DFTR10") and warn.get(ru, 0) > 0 and err.get(ru, 0) == 0:
-            allowed.add(ru)
     by_rule = dict(parsed.get("drc_rules") or {})
     allowed_hit = {r: n for r, n in by_rule.items() if r in allowed}
     eff = {r: n for r, n in by_rule.items() if r not in allowed}

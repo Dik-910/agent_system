@@ -170,40 +170,27 @@ _DOFILE_MARK = "<<<FIXED_DOFILE>>>"
 #     修复由 spec_fixer 按同一份 task_spec 落地。LLM 依然承担了**问题识别与原因定位
 #     （30 分）与修复决策**，只是把「誊写整份脚本」这段纯机械劳动交给确定性代码，
 #     输出量从数千字符降到几百，单次延迟随之落到预算内。
-# 【2026-10-27 默认关闭 full-dofile】
-# 关掉思考模式后实测：诊断 + 整份修复脚本的输出很容易顶到 8000 token 上限被截断
-# （截断 = JSON 不合法 = 整轮白跑，只能回退确定性修复）；把上限提到 16000 又要
-# 250s+，300s 预算的 case 也扛不住。
-# 而"修复脚本"本来就有确定性落地路径（spec_fixer + ensure_required_signals），
-# 且 LLM 给的整份脚本还要过 _validate_fixed_dofile 校验，经常不通过。
-# 所以：默认只让 LLM 做**诊断**（输出短 JSON，100s 内稳定返回），修复由代码落地。
-# 需要回到旧行为时设 SCAN_AGENT_TASK2_FULL_DOFILE_MIN_BUDGET=300。
 _FULL_DOFILE_MIN_BUDGET_S = float(
-    os.environ.get("SCAN_AGENT_TASK2_FULL_DOFILE_MIN_BUDGET", "1e9"))
+    os.environ.get("SCAN_AGENT_TASK2_FULL_DOFILE_MIN_BUDGET", "300"))
 
 _SYSTEM_PROMPT_HEAD = """你是广立微 dftexp_scan（Scan Insertion）工具专家。original.dofile 被注入了故障，
 正确写法就在任务说明书里。请逐条对照，找出所有不一致处。
 
-【输出】一个 JSON（```json 代码块），不要任何额外文字。字段名用下面这组短名：
+【输出】一个 JSON（```json 代码块），不要任何额外文字：
 {
   "issues": [
     {
-      "c": "dofile_execution|drc|dft_config|missing_artifact",
-      "obj": "涉及的命令，如 set_scan_signal -type clock",
-      "at": "L12",
-      "ph": "现象（≤20字）",
-      "rc": "根因（≤30字，点明违反了说明书哪条要求）",
-      "fx": "修复：正确的完整命令与取值（必须可执行）"
+      "category": "dofile_execution|drc|dft_config|missing_artifact",
+      "phenomenon": "现象（一句话）",
+      "located_object": "涉及的命令，如 set_scan_signal -type clock",
+      "locator": "L12",
+      "excerpt": "该行原文片段（用于定位；不确定留空）",
+      "root_cause": "根因：为什么错（引任务说明书要求）",
+      "fix_action": "修复：写出正确的完整命令与取值",
+      "violated_requirement": "被违反的说明书原文（逐字；无则留空）"
     }
   ]
 }
-
-【篇幅纪律 —— 直接决定本 case 耗时】
-1. 每条 issue **写在一行内**，只用上面这 6 个字段，不要缩进美化、不要换行展开。
-2. 不要写 `excerpt` 与 `violated_requirement`：程序会按 `at` 从 original.dofile
-   取整行、按 `rc` 去说明书里匹配原句 —— 你誊抄一遍只是浪费 token 和时间。
-3. `ph` / `rc` 是给评分看的结论，短句即可，不要复述原文、不要论证过程。
-4. `fx` 允许写长（要能直接执行），其余字段一律从简。
 """
 
 # 输出要求（二选一）
@@ -327,9 +314,6 @@ def analyze_and_fix(task, original_dofile, llm, facts=None, understanding=None,
         return None
 
     issues = _normalize_issues(data.get("issues") or [])
-    # excerpt / violated_requirement 由代码从 original.dofile 与 task_spec 回填
-    # （提示词已明确要求模型不写这两项，见 _SYSTEM_PROMPT_HEAD 的篇幅纪律）。
-    issues = _fill_evidence(issues, original_dofile, task)
     if not issues:
         print("  ⚠ LLM 任务二诊断未给出任何问题，回退确定性修复")
         return None
@@ -443,42 +427,17 @@ _ALLOWED_CATEGORIES = {
     "dofile_execution", "drc", "dft_config", "missing_artifact",
 }
 
-# 短字段名 -> 内部字段。为什么要短名见 _SYSTEM_PROMPT_HEAD 的「篇幅纪律」：
-# 单次调用是**按输出 token 线性计时**的（实测约 3s / 条 issue，17 条 issue 就 57s），
-# 8 个长字段里 excerpt / violated_requirement 完全可由程序从原文确定性回填，
-# 让模型誊写一遍纯属浪费。两种键名都接受 —— 老提示词 / 模型自己改回长名也不会挂。
-_FIELD_ALIASES = {
-    "category": ("category", "c"),
-    "located_object": ("located_object", "obj"),
-    "phenomenon": ("phenomenon", "ph"),
-    "locator": ("locator", "at"),
-    "root_cause": ("root_cause", "rc", "why"),
-    "fix_action": ("fix_action", "fx", "fix"),
-    "violated_requirement": ("violated_requirement", "vr"),
-    "excerpt": ("excerpt", "ex"),
-}
-
-
-def _field(it, key):
-    """按别名表取字段（取第一个非空字符串）。"""
-    for name in _FIELD_ALIASES[key]:
-        v = it.get(name)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return ""
-
 
 def _normalize_issues(raw_issues):
     """
     把 LLM 的 issues 归一化成 spec_fixer 同款结构（供 scan_agent._issue_to_record 使用）。
 
-    字段映射（括号内为短名别名，见 _FIELD_ALIASES）：
-        located_object(obj)  -> issue 标题
-        phenomenon(ph)       -> 现象
-        root_cause(rc)       -> 根因
-        fix_action(fx)       -> 修复方式
-        locator(at)          -> 'L12'（无则留空，由 _locate_in_text 按关键词兜底定位）
-        excerpt(ex) / violated_requirement(vr) 通常留空，由 _fill_evidence 回填。
+    字段映射：
+        located_object  -> issue 标题
+        phenomenon      -> 现象
+        root_cause      -> 根因
+        fix_action      -> 修复方式
+        locator         -> 'L12'（无则留空，由 _locate_in_text 按关键词兜底定位）
     """
     out = []
     if not isinstance(raw_issues, list):
@@ -486,12 +445,12 @@ def _normalize_issues(raw_issues):
     for it in raw_issues:
         if not isinstance(it, dict):
             continue
-        obj = _field(it, "located_object")
-        phen = _field(it, "phenomenon")
+        obj = (it.get("located_object") or "").strip()
+        phen = (it.get("phenomenon") or "").strip()
         if not obj and not phen:
             continue
-        cat = _field(it, "category")
-        loc = _field(it, "locator")
+        cat = (it.get("category") or "").strip()
+        loc = (it.get("locator") or "").strip()
         # locator 只接受 'L<数字>' 形式，其余丢弃（避免把编造内容写进证据链）
         if not re.match(r"^L\d+$", loc):
             loc = ""
@@ -500,134 +459,14 @@ def _normalize_issues(raw_issues):
             "issue": obj or phen,
             "located_object": obj or phen,
             "phenomenon": phen or obj,
-            "root_cause": _field(it, "root_cause"),
-            "fix_action": _field(it, "fix_action"),
-            "violated_requirement": _field(it, "violated_requirement"),
+            "root_cause": (it.get("root_cause") or "").strip(),
+            "fix_action": (it.get("fix_action") or "").strip(),
+            "violated_requirement": (it.get("violated_requirement") or "").strip(),
             "locator": loc,
-            "excerpt": _field(it, "excerpt"),
+            "excerpt": (it.get("excerpt") or "").strip(),
             "_source": "llm",
         })
     return out
-
-
-# ---------------------------------------------------------------------------
-# 证据回填：excerpt / violated_requirement 由代码从原文确定性取，不让模型誊写
-# ---------------------------------------------------------------------------
-
-_BIGRAM_STRIP_RE = re.compile(r"[\s，。；、：,.;:()（）「」【】\[\]<>《》“”\"'*#\-_]+")
-
-
-def _bigrams(text):
-    t = _BIGRAM_STRIP_RE.sub("", (text or "").lower())
-    if len(t) < 2:
-        return set()
-    return {t[i:i + 2] for i in range(len(t) - 1)}
-
-
-def _best_spec_sentence(spec, query, min_score=0.18, min_shared=6):
-    """
-    在 task_spec 里找与 query（现象+根因）最贴近的一句原文。
-
-    用途：赛题「引用是否闭合」看的是**说明书原文**，而让模型逐字抄一遍既慢又容易
-    抄错（抄错反而成幻觉）。这里用字符二元组重合度做最近邻：够像才回填，不像就
-    留空 —— 宁可少写，不可编造。
-    """
-    q = _bigrams(query)
-    if not q:
-        return ""
-    cands = []
-    for raw in (spec or "").splitlines():
-        s = raw.strip().lstrip("-*0123456789.、 ").strip()
-        if 6 <= len(s) <= 200:
-            cands.append(s)
-        for part in re.split(r"[。；;]", raw):
-            p = part.strip()
-            if 6 <= len(p) <= 200:
-                cands.append(p)
-    best, best_score = "", 0.0
-    for s in cands:
-        b = _bigrams(s)
-        if not b:
-            continue
-        shared = len(q & b)
-        if shared < min_shared:
-            continue
-        score = shared / float(len(b))
-        if score > best_score:
-            best, best_score = s, score
-    return best if best_score >= min_score else ""
-
-
-def _fill_evidence(issues, source_text, task):
-    """
-    补齐 excerpt（按 locator 取原行）与 violated_requirement（按根因匹配说明书原句）。
-
-    两者都只依赖「LLM 已经给出的定位/结论」，不新增任何判断，因此不会引入幻觉；
-    locator 对不上原文时（模型编造行号）excerpt 留空，由下游按关键词兜底定位。
-    """
-    spec = (task or {}).get("task_spec", "") or ""
-    lines = (source_text or "").splitlines()
-    for it in issues:
-        if not it.get("excerpt") and it.get("locator"):
-            try:
-                n = int(it["locator"][1:])
-            except (TypeError, ValueError):
-                n = 0
-            if 1 <= n <= len(lines):
-                it["excerpt"] = lines[n - 1].strip()[:200]
-        if not it.get("violated_requirement"):
-            it["violated_requirement"] = _best_spec_sentence(
-                spec, (it.get("phenomenon", "") + " " + it.get("root_cause", "")))
-    return issues
-
-
-# ── 「合法的 DRC 豁免」误判过滤 ─────────────────────────────────────────────
-# 题面禁的是「用 set_scan_drc_rule_handling 豁免 DFTR1/DFTR9」，而 ECO 引入
-# conb 常量单元后必然触发 DFTR-TIE1/TIE0 —— 官方 golden 本身就把 TIE 类豁免掉。
-# LLM 容易把这行判成「用豁免掩盖违例」（测试19/20 的 t2/c6 连续两轮如此），
-# 于是诊断记录里写"已删除该行"，产物里它还在（golden 要求保留）。
-_FORBIDDEN_WAIVER_RE = re.compile(
-    r"不得用\s*DRC\s*规则豁免[^。；\n]{0,60}?((?:DFTR[\s-]*[A-Z]*\s*\d+[\s、,，/]*)+)",
-    re.I)
-
-
-def drop_benign_drc_waiver_issues(issues, task_spec, original_dofile):
-    """
-    丢掉「把合法的 DRC 豁免当故障」的误判。
-
-    判据（两条同时成立）：
-      ① 题面明确点名禁止豁免的规则集合 = F（从「不得用 DRC 规则豁免（对 DFTR1/DFTR9）」
-         里抽）；
-      ② original.dofile 里那条豁免的规则集合 R 与 F **不相交** —— 即它豁免的
-         不是题面禁止的那组（典型：TIE 类常量检测）。
-    这类豁免是官方惯例，保留才对；报成问题只会让决策记录与现实打架。
-    """
-    text = task_spec or ""
-    m = _FORBIDDEN_WAIVER_RE.search(text)
-    forbidden = set()
-    if m:
-        forbidden = {x.upper().replace(" ", "")
-                     for x in re.findall(r"DFTR[\s-]*[A-Z]*\s*\d+", m.group(1), re.I)}
-    if not forbidden:
-        return issues                       # 题面没点名禁止 -> 不干预
-
-    orig_rules = set()
-    for ln in (original_dofile or "").splitlines():
-        if "set_scan_drc_rule_handling" in ln:
-            orig_rules |= {x.upper().replace(" ", "")
-                           for x in re.findall(r"DFTR[\s-]*[A-Z]*\s*\d+", ln, re.I)}
-    if not orig_rules or (orig_rules & forbidden):
-        return issues                       # 豁免的正是被禁规则（或无规则可判）-> 保留问题
-
-    kept = []
-    for it in issues:
-        blob = " ".join(str(it.get(k, "")) for k in
-                        ("issue", "phenomenon", "requirement", "evidence",
-                         "fix_action", "root_cause", "violated_requirement"))
-        if "set_scan_drc_rule_handling" in blob or "规则豁免" in blob:
-            continue                        # 该问题只是在要求删除这条合法豁免
-        kept.append(it)
-    return kept
 
 
 def merge_issues(primary, secondary, original_text=""):
@@ -649,7 +488,6 @@ def merge_issues(primary, secondary, original_text=""):
     merged, seen = [], set()
     # 值 -> 已占用该值的问题键（用于「一方没有命令名、只有对象值」时仍然能合并）
     value_owner = {}
-    kept = {}          # key -> 已保留的那条（用于给重复项补字段，见 _backfill）
     for it in list(primary or []) + list(secondary or []):
         if not isinstance(it, dict):
             continue
@@ -658,7 +496,6 @@ def merge_issues(primary, secondary, original_text=""):
         if not cmd and not values:
             continue
         if key in seen:
-            _backfill(kept.get(key), it)
             continue
         # 命令名缺失时，退化为「按对象值」判重：只要涉及同一个端口/实例/参数值，
         # 就视为同一问题（LLM 侧常用自然语言描述，没有命令名）。
@@ -670,29 +507,12 @@ def merge_issues(primary, secondary, original_text=""):
                     break
             if owner is not None:
                 seen.add(owner)
-                _backfill(kept.get(owner), it)
                 continue
         seen.add(key)
-        kept[key] = it
         for val in values:
             value_owner.setdefault(val, key)
         merged.append(it)
     return merged
-
-
-def _backfill(dst, src):
-    """
-    重复项不去重进 merged，但它的**证据字段**不能白丢。
-
-    LLM 现在只写短字段（excerpt / violated_requirement 由程序回填，可能为空），
-    而 spec_fixer 的同一问题带手写的 violated_requirement —— 若直接丢掉重复项，
-    证据链会从「有说明书原句」退化成空。因此把缺失字段从被丢弃项迁移过来。
-    """
-    if not isinstance(dst, dict) or not isinstance(src, dict):
-        return
-    for f in ("violated_requirement", "excerpt", "locator", "root_cause", "fix_action"):
-        if not dst.get(f) and src.get(f):
-            dst[f] = src[f]
 
 
 # 命令名：只认 dftexp_scan 的真实命令族前缀。

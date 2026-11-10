@@ -46,8 +46,6 @@ case5 的网表 264MB / 210 万实例，case1 只有 3.8MB。全部事实都做�
   · 全程有 deadline 检查，超时立刻返回已抽到的部分（宁少不错）。
 """
 
-import bisect
-import mmap
 import os
 import re
 import time
@@ -63,11 +61,6 @@ _UNLOADED_PORTS_MAX_BYTES = int(
     os.environ.get("SCAN_AGENT_UNLOADED_PORTS_MAX_MB", "24")) * 1024 * 1024
 MAX_CHAINS = int(os.environ.get("SCAN_AGENT_MAX_CHAINS", "2000"))
 _CHUNK = 4 << 20
-
-# 整读进内存的上限：小于它就按「整体切片」处理，超过则流式分块。
-# 259MB 的网表整读约 260MB（ASCII 文本在 CPython 里 1 字节/字符），
-# 评测容器 8GB，安全余量足够；再大就走流式，避免 OOM 反而更慢。
-_WHOLE_FILE_LIMIT = int(os.environ.get("SCAN_AGENT_WHOLE_FILE_LIMIT_MB", "600")) << 20
 
 
 # ===========================================================================
@@ -197,41 +190,11 @@ def _norm_net(sig):
 
 def iter_module_blocks(path):
     """
-    产出 (module_name, header_text, body_text)。
+    流式产出 (module_name, header_text, body_text)。
 
-    两条路径（结果完全一致，只是内存/速度取舍）：
-      · 小文件（<= _WHOLE_FILE_LIMIT）：整读进内存，用两个已编译正则定位
-        `module` / `endmodule` 边界再做切片。切片与定位都在 C 层完成，
-        task_1/case5（259MB / 1031 万行）实测 11.5s -> 1.4s；
-      · 超大文件：退回流式分块（每块 4MB），常驻内存只有几 MB。
+    264MB 的网表整读进内存会占 500MB+，因此按 `module ... endmodule` 边界切块，
+    单块解析完即可丢弃。块内没有 endmodule 时会累积到下一次出现（正常网表不会）。
     """
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        size = -1
-    if 0 <= size <= _WHOLE_FILE_LIMIT:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            text = fh.read()
-        pos = 0
-        while True:
-            m = _MODULE_RE.search(text, pos)
-            if not m:
-                return
-            name = m.group(1)
-            h = text.find(";", m.end())
-            if h == -1:
-                return
-            hdr = text[m.end():h]
-            e = _ENDMODULE_RE.search(text, h + 1)
-            if not e:
-                tail = text[h + 1:]
-                if tail.strip():
-                    yield name, hdr, tail
-                return
-            yield name, hdr, text[h + 1:e.start()]
-            pos = e.end()
-
-    # ---- 流式路径（超大网表）----
     buf = ""
     cur_name = None
     cur_hdr = ""
@@ -283,46 +246,25 @@ def _parse_ports(body):
     return ports
 
 
-_EMPTY_CONNS = {}
-
-
-def parse_module(body, lib_meta, light=False):
+def parse_module(body, lib_meta):
     """
     解析单个 module。
-
-    Args:
-        light: 只统计「实例数 / 时序单元种类 / 层次子模块」，**不解析引脚连接**。
-            大网表（实例数超过 MAX_CHAIN_INSTS）一旦丢弃 module_insts，引脚表就再也
-            没有人读，而解析引脚占本函数 2/3 的时间（每个实例一次 find(");") +
-            一次 _PIN_CONN_RE 扫描 + 每个引脚一次 _norm_net）。task_1/case5
-            （259MB / 65 万 FF）实测全量解析 21.8s，light 解析 5.9s。
 
     Returns:
         {
           "ports": {name: direction},
-          "insts": [(cell, inst, {pin: net})],       # light 模式下为空列表
-          "n_insts": int,                            # 实例总数（light 模式也要准）
+          "insts": [(cell, inst, {pin: net})],
           "seq_insts": [(cell, inst, {pin: net})],   # 库中判定为时序单元的
           "submods": [(cell, inst)],                 # 不在库中 -> 层次实例
         }
     """
     ports = _parse_ports(body)
     insts, seq_insts, submods = [], [], []
-    n_insts = 0
     for m in _INST_RE.finditer(body):
         cell = m.group(1)
         if cell in _VERILOG_KW:
             continue
-        n_insts += 1
         inst = m.group(2).strip()
-        lm = lib_meta.get(cell)
-        if light:
-            # 引脚连接不解析：rec 里给一个共享空 dict，避免 N 个空 dict 的内存开销。
-            if lm is None:
-                submods.append((cell, inst))
-            elif lm["seq"]:
-                seq_insts.append((cell, inst, _EMPTY_CONNS))
-            continue
         end = body.find(");", m.end())
         blob = body[m.end():end] if end != -1 else body[m.end():m.end() + 6000]
         conns = {}
@@ -330,12 +272,12 @@ def parse_module(body, lib_meta, light=False):
             conns[pm.group(1)] = _norm_net(pm.group(2))
         rec = (cell, inst, conns)
         insts.append(rec)
+        lm = lib_meta.get(cell)
         if lm is None:
             submods.append((cell, inst))
         elif lm["seq"]:
             seq_insts.append(rec)
-    return {"ports": ports, "insts": insts, "n_insts": n_insts,
-            "seq_insts": seq_insts, "submods": submods}
+    return {"ports": ports, "insts": insts, "seq_insts": seq_insts, "submods": submods}
 
 
 def _seq_pins(cell, lib_meta):
@@ -364,18 +306,6 @@ def empty_facts(note=""):
         "ff_types": {}, "sff_types": {}, "dff_types": {},
         "ff_count": 0, "sff_count": 0,
         "clock_ports": {}, "se_ports": {},
-        # 时钟网络结构（决定 set_scan_cfg -internal_clocks / -mix_edges）：
-        #   clock_derived  : 顶层时钟端口经**组合逻辑**（buf/inv/门）后再驱动 FF 的数量
-        #   clock_inverted : 其中经奇数个反相器（即负沿）驱动的数量
-        # 依据手册 2.1.2.2：single 是「任意一个经过任意组合逻辑门（含 buffer/inverter）
-        # 后的时钟域视为单独的内部时钟域」；不识别内部时钟域时，派生网络上的 FF
-        # 会被当成同一时钟域而混插（t1/case6 的 clk 经 buf 派生 n1/n2/n3，
-        # 分别驱动 1152/1136/1057 个 FF，还有一个 inv_2 派生负沿）。
-        "clock_derived": {}, "clock_inverted": {},
-        # 顶层时钟端口 -> 实际驱动 FF.CLK 的**不同叶子网络**（时钟树末端）。
-        # 叶子网络 ≥2 才说明「同一顶层时钟派生出了多个内部时钟域」——
-        # 这正是 set_scan_cfg -internal_clocks 要处理的场景（手册 2.1.2.2）。
-        "clock_leaf_nets": {},
         "shift_chains": [], "chains_truncated": False,
         "extra_modules": [],
         "associated_internal_clocks": "",
@@ -453,57 +383,6 @@ def _detect_top(claimed, seen_modules, all_submods, module_insts, mod_ports):
     return ranked[0]
 
 
-
-_INST_LINE_RE = re.compile(r"^\s*([A-Za-z_][\w$]*)\s+([A-Za-z_][\w$]*)\s*\(")
-_VERILOG_KEYWORDS = {
-    "input", "output", "inout", "wire", "reg", "assign", "always", "initial",
-    "parameter", "localparam", "integer", "generate", "endgenerate", "if", "else",
-    "case", "endcase", "function", "task", "module", "endmodule", "begin", "end",
-    "for", "while", "repeat", "forever", "supply0", "supply1", "tri", "wand", "wor",
-}
-
-
-def top_instances(task, facts=None):
-    """
-    取顶层模块体内**被实例化的子模块**（名称 + 类型）。
-
-    为什么要这个：分区流要写 `add_scan_partition <p> -include {实例...}`，
-    而实例名只存在于网表里，任务书不会给（public/task_1/case2 的 golden 用
-    u0~u26，任务书只写「输入 FIFO（3 个）」）。没有这份清单就无法划分区。
-
-    Returns:
-        list[tuple[str, str]]: [(实例名, 模块类型), ...]（保持网表内顺序）
-    """
-    f = facts or {}
-    top = f.get("top") or (task or {}).get("top_module") or ""
-    netlists = (task or {}).get("files", {}).get("netlist") or []
-    if not top or not netlists:
-        return []
-
-    for path in netlists:
-        try:
-            text = Path(path).read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        m = re.search(r"\bmodule\s+" + re.escape(top) + r"\b", text)
-        if not m:
-            continue
-        end = text.find("endmodule", m.end())
-        body = text[m.end(): end if end != -1 else len(text)]
-        out, seen = [], set()
-        for line in body.splitlines():
-            mm = _INST_LINE_RE.match(line)
-            if not mm:
-                continue
-            mtype, name = mm.group(1), mm.group(2)
-            if mtype in _VERILOG_KEYWORDS or name in seen:
-                continue
-            seen.add(name)
-            out.append((name, mtype))
-        return out
-    return []
-
-
 def extract_facts(task, deadline=None, want_chains=True, verbose=False):
     """
     抽取本 case 的网表事实。任何异常都退化为「空事实」而非抛错 ——
@@ -545,10 +424,8 @@ def extract_facts(task, deadline=None, want_chains=True, verbose=False):
                     facts["notes"].append("解析达到时间上限，事实可能不完整")
                     break
                 seen_modules.append(name)
-                # keep_detail 一旦为 False，module_insts 已被清空且不再回填 ——
-                # 之后每个模块的引脚表都没有读者，用 light 解析跳过（见 parse_module）。
-                pm = parse_module(body, lib_meta, light=not keep_detail)
-                total_insts += pm["n_insts"]
+                pm = parse_module(body, lib_meta)
+                total_insts += len(pm["insts"])
                 for cell, _inst in pm["submods"]:
                     all_submods.add(cell)
                 mod_ports[name] = pm["ports"]
@@ -645,19 +522,8 @@ def _bump(facts, cell, lib_meta):
         facts["dff_types"][cell] = facts["dff_types"].get(cell, 0) + 1
 
 
-# 反相器单元名（sky130 的 `...__inv_2` / `__invb_1`，以及 `INVX1` 这类通用命名）。
-# 只用于统计「负沿时钟」数量，判错最多让 clock_inverted 偏差，不影响主流程。
-_INV_CELL_RE = re.compile(r"(?:^|__|_)inv[a-z]?_?\d*$|^invx?\d*$", re.I)
-
-
 def _trace_top_ports(facts, top, module_insts, lib_meta):
-    """把顶层时序单元的 CLK / SCE 反向解析到顶层输入端口，统计驱动数。
-
-    同时记录时钟网络的结构事实（供 set_scan_cfg 推导）：
-      · clock_ports   : 端口驱动的时序单元总数（含直连与派生）
-      · clock_derived : 其中**经过组合逻辑**（buf/inv/门）才到达 CLK 的数量
-      · clock_inverted: 其中经过奇数个反相器的数量（负沿，mix_edges 相关）
-    """
+    """把顶层时序单元的 CLK / SCE 反向解析到顶层输入端口，统计驱动数。"""
     pm = module_insts.get(top)
     if not pm:
         return
@@ -670,25 +536,22 @@ def _trace_top_ports(facts, top, module_insts, lib_meta):
         outs = meta.get("out_pins") or set()
         for pin, net in conns.items():
             if pin in outs and net:
-                net_driver[net] = (conns, cell)
+                net_driver[net] = conns
     for p, d in ports.items():
         if d == "input":
             net_driver.setdefault(p, None)
 
-    def resolve(net, depth=0, inv=0):
-        """返回 (顶层输入端口, 经过的组合逻辑级数, 反相器个数) 或 None。"""
+    def resolve(net, depth=0):
         if not net or depth > 6:
             return None
         if ports.get(net) == "input":
-            return (net, depth, inv)
-        drv = net_driver.get(net)
-        if not drv:
+            return net
+        conns = net_driver.get(net)
+        if not conns:
             return None
-        conns, drv_cell = drv
-        inv_here = 1 if _INV_CELL_RE.search(drv_cell or "") else 0
         for pin, up in conns.items():
             if pin in ("X", "Y", "Z", "Q", "A", "A1", "A2", "I", "Y1", "Y2"):
-                r = resolve(up, depth + 1, inv + inv_here)
+                r = resolve(up, depth + 1)
                 if r:
                     return r
         return None
@@ -696,27 +559,13 @@ def _trace_top_ports(facts, top, module_insts, lib_meta):
     for cell, _inst, conns in pm["seq_insts"]:
         clk, _d, _q, _scd, sce = _seq_pins(cell, lib_meta)
         if clk:
-            r = resolve(conns.get(clk))
-            if r:
-                src, hops, inv = r
+            src = resolve(conns.get(clk))
+            if src:
                 facts["clock_ports"][src] = facts["clock_ports"].get(src, 0) + 1
-                if hops > 0:
-                    facts["clock_derived"][src] = \
-                        facts["clock_derived"].get(src, 0) + 1
-                if inv % 2 == 1:
-                    facts["clock_inverted"][src] = \
-                        facts["clock_inverted"].get(src, 0) + 1
-                # FF.CLK 直接连的那个网络 = 时钟树叶子。同一个顶层时钟下
-                # 出现多个不同叶子 = 派生出了多个内部时钟域。
-                leaf = conns.get(clk)
-                if leaf and leaf != src:
-                    facts["clock_leaf_nets"].setdefault(src, [])
-                    if leaf not in facts["clock_leaf_nets"][src]:
-                        facts["clock_leaf_nets"][src].append(leaf)
         if sce:
             src = resolve(conns.get(sce))
             if src:
-                facts["se_ports"][src[0]] = facts["se_ports"].get(src[0], 0) + 1
+                facts["se_ports"][src] = facts["se_ports"].get(src, 0) + 1
 
 
 def _extra_modules(seen_modules, mod_ports, lib_meta, top, submods):
@@ -774,13 +623,6 @@ def wrapper_semantics(ports):
 _MOD_DEF_RE = re.compile(rb"^\s*module\s+([A-Za-z_][\w$]*)")
 _EMPTY_PIN_RE = re.compile(rb"\.\s*([A-Za-z_][\w$]*)\s*\(\s*\)")
 _OUT_DECL_RE = re.compile(rb"^\s*output\b([^;]*);", re.M)
-# 整文件版用的「行首锚定」变体（配合 finditer 一次性扫完整个文件）。
-_MOD_DEF_ALL_RE = re.compile(rb"(?m)^[ \t]*module[ \t]+([A-Za-z_][\w$]*)")
-_INST_LINE_ALL_RE = re.compile(
-    rb"(?m)^[ \t]*([A-Za-z_][\w$]*)[ \t]+(\\[^\s()]+|[A-Za-z_][\w$]*)[ \t]*\(")
-# 续行归因时向前回溯的窗口：DC 输出的一个实例（含全部引脚）通常 < 4KB，
-# 64KB 已能覆盖极端的长行；回溯不到就抛错退回逐行版，不会给出错误结果。
-_FLOATING_BACK_WINDOW = 65536
 # 注意：本文件另有一个 str 版 _IDENT_RE（供文本解析用），这里的 bytes 版必须
 # 用独立名字 —— 早期版本复用了 _IDENT_RE，结果覆盖掉 str 版，
 # 导致 iter_module_blocks 抛 "cannot use a bytes pattern on a string-like object"。
@@ -835,119 +677,10 @@ def find_floating_clock_roots(netlist_paths, top, deadline=None, max_paths=64):
 
 
 def _floating_roots_one_file(netlist_path, top, deadline=None):
-    """
-    单文件版伪主输入推导。小文件走「整读 + 行首锚定正则一次扫完」，
-    超大文件回流式逐行版（结果一致，见 _floating_roots_stream）。
-
-    为什么两套：逐行 Python 循环在 1031 万行上是 9.4s（case5 实测），而整读后
-    用 finditer 扫同一文件只要 0.5s —— 瓶颈是 Python 层循环次数，不是正则本身。
-    """
+    """单文件版的伪主输入推导（两遍扫描 + 定向 seek）。"""
     top_b = str(top or "").encode()
     if not top_b:
         return []
-    try:
-        size = os.path.getsize(netlist_path)
-    except OSError:
-        size = -1
-    if 0 <= size <= _WHOLE_FILE_LIMIT:
-        try:
-            return _floating_roots_whole(netlist_path, top_b)
-        except Exception:                                       # noqa: BLE001
-            pass            # 任何意外都退回逐行版，语义完全一致
-    return _floating_roots_stream(netlist_path, top_b, deadline)
-
-
-def _floating_roots_whole(netlist_path, top_b):
-    """整读版：三遍 C 层扫描 + 定向切片，语义与逐行版逐条对齐。"""
-    with open(netlist_path, "rb") as fh:
-        data = fh.read()
-
-    # ── Pass 1a：悬空时钟引脚 ────────────────────────────────────────
-    hits = [m.start() for m in _EMPTY_PIN_RE.finditer(data)
-            if _clkish_name(m.group(1))]
-    if not hits:
-        return []
-
-    # ── Pass 1b：模块定义偏移（归因边界 + pass 3 定位用）─────────────
-    mods = [(m.start(), m.group(1)) for m in _MOD_DEF_ALL_RE.finditer(data)]
-    mod_pos = [o for o, _n in mods]
-    mod_off = {}
-    for off, name in mods:
-        mod_off.setdefault(name, off)
-
-    # ── Pass 1c：把每个悬空引脚归因到 (所属 module, 实例类型, 实例名) ──
-    floating = []
-    for pos in hits:
-        ls = data.rfind(b"\n", 0, pos) + 1
-        le = data.find(b"\n", ls)
-        line = data[ls: le if le != -1 else len(data)]
-        if line.lstrip().startswith(b"."):
-            # 引脚落在实例的续行上：回退到最近一条实例首行
-            back = max(0, ls - _FLOATING_BACK_WINDOW)
-            last = None
-            for m in _INST_LINE_ALL_RE.finditer(data, back, ls):
-                last = (m.group(1), m.group(2))
-            if last is None:
-                raise RuntimeError("continuation without instance")
-            itype, iname = last
-        else:
-            parts = line.split(None, 2)
-            itype, iname = (parts[0], parts[1]) if len(parts) >= 2 else (b"", b"")
-        if not itype or not iname:
-            continue
-        idx = bisect.bisect_right(mod_pos, pos) - 1
-        floating.append((mods[idx][1] if idx >= 0 else b"", itype, iname))
-    if not floating:
-        return []
-
-    # ── Pass 2：实例索引 child_module -> [(parent_module, inst_name)] ──
-    index = {}
-    cur = -1
-    n_mod = len(mod_pos)
-    for m in _INST_LINE_ALL_RE.finditer(data):
-        p = m.start()
-        while cur + 1 < n_mod and mod_pos[cur + 1] <= p:
-            cur += 1
-        parent = mods[cur][1] if cur >= 0 else b""
-        index.setdefault(m.group(1), []).append((parent, m.group(2)))
-
-    # ── Pass 3：定向取模块定义的输出引脚 + 反向 BFS 重建层次路径 ──────
-    out = []
-    for mod, itype, iname in floating:
-        off = mod_off.get(itype)
-        if off is None:
-            continue
-        seg = data[off: off + 4096]
-        e = seg.find(b"endmodule")
-        seg = seg[: e if e > 0 else len(seg)]
-        outpins = []
-        for m in _OUT_DECL_RE.finditer(seg):
-            for tok in _B_PORT_TOKEN_RE.findall(m.group(1)):
-                if _clkish_name(tok):
-                    outpins.append(tok)
-        if not outpins:
-            continue
-        outpin = outpins[0]
-        paths = []
-        queue = [(mod, [])]
-        guard = 0
-        while queue and len(paths) < 8 and guard < 20000:
-            guard += 1
-            mm, chain = queue.pop(0)
-            if mm == top_b:
-                paths.append(chain)
-                continue
-            if len(chain) > 24:
-                continue
-            for pmod, pinst in index.get(mm, []):
-                queue.append((pmod, [pinst] + chain))
-        for chain in paths:
-            out.append(b"/".join(chain + [iname, outpin]).decode())
-    return out
-
-
-def _floating_roots_stream(netlist_path, top_b, deadline=None):
-    """逐行版（超大网表）：原实现，两遍扫描 + 定向 seek。"""
 
     # ── Pass 1：module 定义偏移 + 悬空时钟引脚实例 ──────────────────────
     mod_off = {}
@@ -1166,191 +899,6 @@ def _icg_facts(facts, lib_meta, module_insts, top):
     facts["icg"]["cells"] = icg_types
     facts["icg"]["top_clk_nodes"] = nodes[:400]
     facts["icg"]["floating_clk"] = [n for n in nodes if not n.get("clk_net")][:200]
-
-
-# ============================================================================
-# 实例引用回查：短名 -> 完整层级路径 + 真实引脚名
-# ============================================================================
-
-# 回查要整读网表建索引，80MB 以内 <1s；再大就放弃回查（保持原样，绝不猜）。
-_REF_RESOLVE_MAX_BYTES = int(
-    os.environ.get("SCAN_AGENT_REF_RESOLVE_MAX_MB", "80")) << 20
-
-# bool 版引脚名匹配（回查走 bytes，不能复用 str 版 _PIN_CONN_RE）
-_PIN_NAME_B_RE = re.compile(rb"\.\s*([A-Za-z_][\w$]*)\s*\(")
-
-
-def resolve_instance_refs(netlist_paths, top, names, deadline=None, max_paths=4):
-    """
-    回查网表：把「短实例名」解析成从 top 起的完整层级路径，并带回该实例的引脚名。
-
-    为什么需要（2026-10-30，新 case 复盘两处硬伤）：
-
-      1. **短名静默失效**：task_spec 里的对象名常是短名（`x_cr_sys_io_pll`），
-         而工具按层次路径匹配。写成短名时 `set_scan_element false` 匹配不到，
-         回替数为 0 —— 不报错，比报错更难发现。同一份代码在 case1 给全路径、
-         在别的 case 给短名，说明不能指望模型每次写全。
-      2. **编造引脚**：拼 `实例/Q` 这类引用时没查网表，遇到输出引脚不叫 Q 的
-         单元（QN / Q_N / lat_q）就是 `SCAN-1620 ... does not exist`。
-
-    Args:
-        names: 待解析的名字集合（短名或已带路径的都行）
-
-    Returns:
-        {name: [{"path": "a/b/inst", "cell": "MOD", "pins": {pin, ...}}, ...]}
-        解析不了（网表过大 / 找不到 / 无 top）返回空 dict —— 调用方保持原样，
-        **绝不**用猜测替代。
-    """
-    names = {str(n).strip() for n in (names or []) if str(n).strip()}
-    top_b = str(top or "").encode()
-    if not names or not top_b:
-        return {}
-    files = [p for p in (netlist_paths or []) if p]
-    try:
-        if sum(os.path.getsize(p) for p in files) > _REF_RESOLVE_MAX_BYTES:
-            return {}
-    except OSError:
-        return {}
-
-    found = {}          # name -> [(module, cell, pos)]
-    parents = {}        # child_module -> [(parent_module, inst)]
-    mod_names = set()
-    for path in files:
-        try:
-            with open(path, "rb") as fh:
-                data = fh.read()
-        except OSError:
-            continue
-        if deadline is not None and time.time() > deadline:
-            return {}
-        mods = [(m.start(), m.group(1)) for m in _MOD_DEF_ALL_RE.finditer(data)]
-        if not mods:
-            continue
-        mod_names |= {n for _o, n in mods}
-        mod_pos = [o for o, _n in mods]
-        for m in _INST_LINE_ALL_RE.finditer(data):
-            cell, inst = m.group(1), m.group(2)
-            idx = bisect.bisect_right(mod_pos, m.start()) - 1
-            parent = mods[idx][1] if idx >= 0 else b""
-            if cell in mod_names:       # 只对「实例化子模块」建反查索引
-                parents.setdefault(cell, []).append((parent, inst))
-            key = inst.decode("utf-8", "replace")
-            if key in names:
-                found.setdefault(key, []).append((parent, cell, inst, m.end(), data))
-
-    out = {}
-    for name, hits in found.items():
-        entries, seen = [], set()
-        for parent, cell, inst, pos, data in hits:
-            # 用实例名向上重建层次路径（同名 module 多处实例化时会有多条）
-            queue, guard = [(parent, [inst])], 0
-            paths = []
-            while queue and len(paths) < max_paths and guard < 20000:
-                guard += 1
-                mod, chain = queue.pop(0)
-                if mod == top_b or not mod:
-                    paths.append(b"/".join(chain))
-                    continue
-                ups = parents.get(mod) or []
-                if not ups or len(chain) > 24:
-                    continue
-                for up_mod, up_inst in ups:
-                    queue.append((up_mod, [up_inst] + chain))
-            pins = set()
-            blob = data[pos: pos + 6000]
-            end = blob.find(b");")
-            for pm in _PIN_NAME_B_RE.finditer(blob[: end if end != -1 else len(blob)]):
-                pins.add(pm.group(1).decode("utf-8", "replace"))
-            cell_s = cell.decode("utf-8", "replace")
-            for p in paths or [b"/".join([b])]:
-                pth = p.decode("utf-8", "replace")
-                if pth in seen:
-                    continue
-                seen.add(pth)
-                entries.append({"path": pth, "cell": cell_s, "pins": pins})
-        if entries:
-            out[name] = entries[:max_paths]
-    return out
-
-
-def resolve_instance_paths(netlist_paths, top, names, deadline=None, max_paths=4):
-    """只要路径的简化版（见 resolve_instance_refs）。"""
-    got = resolve_instance_refs(netlist_paths, top, names, deadline, max_paths)
-    return {k: [e["path"] for e in v] for k, v in got.items()}
-
-
-# 单实例引脚探测的缓存：(网表指纹, 实例名) -> 引脚集 / None
-_PIN_PROBE_CACHE = {}
-
-
-def probe_instance_pins(netlist_paths, inst_name, window=65536):
-    """
-    大网表兜底：**不建索引**，只把某一个实例的引脚名捞出来（mmap + C 层 find）。
-
-    为什么需要这条通道：`resolve_instance_refs` 要整读 + 建层级索引，259MB 的
-    网表要 4s/500MB，所以超过 80MB 就整个跳过回查 —— 结果是**大网表上的假引脚
-    依然会被写出去**（`SCAN-1620 does not exist`，整份 dofile 中断）。而校验
-    「这个实例有没有这个引脚」根本不需要全表索引：定位到那一个实例的连接块就够了。
-    mmap 让 `find` 在 C 层跑、不占进程内存，259MB 单次 ~0.2s。
-
-    Returns:
-        set(引脚名) —— 找到了实例且连接块完整；
-        None        —— 找不到 / 连接块被窗口截断（**无法确认**，调用方必须保持原样，
-                       绝不能当成"引脚不存在"而删引用）。
-    """
-    name_b = str(inst_name or "").strip().encode()
-    if not name_b:
-        return None
-    key = (tuple(netlist_paths or ()), inst_name)
-    if key in _PIN_PROBE_CACHE:
-        return _PIN_PROBE_CACHE[key]
-
-    def _boundary_ok(before, after):
-        if before and (before.isalnum() or before in (b"_", b"/", b".", b"[")):
-            return False
-        return after in (b" ", b"\t", b"(", b"\n", b"\r", b")", b",")
-
-    result = None
-    seen = set()
-    for path in netlist_paths or []:
-        try:
-            with open(path, "rb") as fh:
-                try:
-                    mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
-                except (ValueError, OSError):
-                    continue                # 空文件
-                with mm:
-                    pos = 0
-                    while True:
-                        i = mm.find(name_b, pos)
-                        if i < 0:
-                            break
-                        pos = i + len(name_b)
-                        before = mm[i - 1:i] if i else b"\n"
-                        after = mm[pos:pos + 1]
-                        if not _boundary_ok(before, after):
-                            continue
-                        blob = mm[pos:pos + window]
-                        end = blob.find(b");")
-                        if end == -1:
-                            continue        # 连接块被窗口截断 -> 不确认，继续找下一处
-                        pins = {m.group(1).decode("utf-8", "replace")
-                                for m in _PIN_NAME_B_RE.finditer(blob[:end + 2])}
-                        # **取并集**，不要命中第一处就返回。
-                        # 同名实例在多个 module 里都出现时（层次设计里很常见），
-                        # 第一处可能根本不是我们要的那个 —— 2026-10-31 测试14 的
-                        # t1/case5 就是这么被判成"引脚不存在"，把
-                        # `-associated_internal_clocks` 删掉，DRC 直接爆 DFTR9×4215。
-                        # 校验语义只需要"这个引脚名在该实例的某处连接里存在"。
-                        if pins:
-                            seen |= pins
-            if seen:
-                break
-        except OSError:
-            continue
-    result = seen or None
-    _PIN_PROBE_CACHE[key] = result
-    return result
 
 
 def _unloaded_ports(netlist_paths, top, deadline=None, limit=40):
@@ -1824,139 +1372,24 @@ def summary_for_prompt(facts, limit_chars=6500):
     return text
 
 
-_SEG_NUM_RE = re.compile(r"\[(\d+)\]")
-
-# 一个 for 循环至少覆盖这么多段才划算（更少的组直接展开，读起来更直白）
-_SEG_LOOP_MIN = 6
-
-
-def _unwrap(s):
-    """把 si/se/so 里的**最外层**引号去掉（事实里可能带引号也可能不带）。"""
-    s = (s or "").strip()
-    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("\"", "'"):
-        return s[1:-1]
-    return s
-
-
-def _seg_nums(s):
-    return [int(x) for x in _SEG_NUM_RE.findall(s)]
-
-
-def _seg_shape(chain):
-    """同族链的签名：把数字下标全抹成 [#]，其余字符原样保留。"""
-    return tuple(_SEG_NUM_RE.sub("[#]", _unwrap(chain.get(k))) for k in ("si", "se", "so"))
-
-
-def _loop_group(chains):
+def segment_commands(facts, min_length=2, name_prefix="seg", max_chains=None):
     """
-    判断一组同族链能不能用一个 for 循环表达；能则返回合并所需的信息。
+    由移位链事实确定性生成 `set_scan_segment` 命令行。
 
-    判定条件（全部满足才合并，否则调用方退回逐条展开）：
-      1. si/se/so 的模板一致（数字下标以外的字符完全相同）；
-      2. 每条链的下标个数一致；
-      3. **只有一处下标在变**，且 si/se/so 里变的那处取值序列完全一致；
-      4. 取值是连续整数（步长 1），否则 `$i` 跟不上。
-    第 3 条是安全阀：像 `key_c_r_reg[0][i]` 与 `key_c_r_reg[1][i]` 这种
-    两处都在变的，合并成 `[$i][$i]` 就是错的，必须拆开或展开。
+    task_spec 要求「所有长移位寄存器均配置为 scan segment，不得拆分」时，正确做法
+    就是把每条链（长度 >= min_length）配成一个 segment，si/se/so 取链首/链尾的真实
+    端口路径 —— **只需要网表事实，不需要 golden**。
+
+    写法对齐手册 2.2.9 与实测 golden：
+        set_scan_segment <name> -lockup_exists false \\
+            -access [list scan_enable <se> scan_data_in <si> scan_data_out <so>]
+
+    Returns:
+        (lines: list[str], covered: int)
     """
-    seqs = {}
-    for key in ("si", "se", "so"):
-        nums = [_seg_nums(_unwrap(c.get(key))) for c in chains]
-        if len({len(n) for n in nums}) != 1:
-            return None
-        seqs[key] = nums
-
-    varying = {}                                  # key -> [在该串里的第几个下标]
-    for key, nums in seqs.items():
-        varying[key] = [i for i in range(len(nums[0]))
-                        if len({n[i] for n in nums}) > 1]
-
-    sizes = {len(v) for v in varying.values()}
-    if len(sizes) != 1 or not sizes or sizes.pop() == 0:
-        return None                               # 各串变化处不一致，或根本没有变化
-
-    # 所有变化处的取值序列必须一致
-    first = None
-    for key, nums in seqs.items():
-        for pos in varying[key]:
-            seq = tuple(n[pos] for n in nums)
-            if first is None:
-                first = seq
-            elif seq != first:
-                return None
-
-    values = sorted(set(first))
-    if values != list(range(values[0], values[0] + len(values))):
-        return None                               # 不连续，$i 用不了
-    # 方向跟随事实顺序：事实里链是降序排的（如 55,54,...），循环就得倒着数，
-    # 否则 seg 名字和链的绑定会跟逐条版错位。
-    direction = -1 if first[0] > first[-1] else 1
-    return {"varying": varying, "count": len(values),
-            "start": values[0], "end": values[-1], "direction": direction}
-
-
-def _loop_lines(chains, group, name_prefix, base):
-    """
-    生成一个 for 循环块。
-
-    **括号不转义**（2026-10-28 容器内 puts 实测，修正早前基于标准 tclsh 的误判）：
-    dftexp_scan 的自制解析器对 `\\[55\\]` 报 `Invalid command name '55\\'`
-    （反斜杠不被支持），而 `[55]` 字面保留、`[$v]` 做变量替换后字面保留，
-    与官方 golden 的未转义写法一致。标准 tclsh 会把 `[0]` 当命令替换，
-    那是标准行为与工具行为的差异 —— 比赛以工具为准。
-
-    降序事实生成 `set v [expr {N - $i}]`（双引号外，工具实测支持 [expr]），
-    路径内用 `[$v]` —— 保证 seg 名字与链的绑定和逐条版逐条一致。
-    """
-    count, start = group["count"], group["start"]
-    descending = group.get("direction") == -1
-    out = []
-    assigns = []
-    for key in ("si", "se", "so"):
-        s = _unwrap(chains[0].get(key))
-        if not s:
-            continue
-        vpos = group["varying"].get(key) or []
-        # 把"变化的那一处"换成 $i（升序）或 $v（降序），其余下标原样保留
-        nums = _seg_nums(s)
-        pieces, cursor = [], 0
-        for occ, m in enumerate(_SEG_NUM_RE.finditer(s)):
-            pieces.append(s[cursor:m.start()])
-            if occ in vpos:
-                pieces.append("[$v]" if descending else "[$i]")
-            else:
-                pieces.append(m.group(0))
-            cursor = m.end()
-        pieces.append(s[cursor:])
-        assigns.append("    set %s \"%s\"" % (key, "".join(pieces)))
-
-    acc = []
-    if all(c.get("se") for c in chains):
-        acc.append("scan_enable $se")
-    acc.append("scan_data_in $si")
-    acc.append("scan_data_out $so")
-
-    name = f"{name_prefix}$i" if base == 0 else f"{name_prefix}[expr {{{base} + $i}}]"
-    out.append(f"# {count} 段：{_unwrap(chains[0].get('si'))} 起，下标 {start}..{start + count - 1}")
-    out.append(f"for {{set i 0}} {{$i < {count}}} {{incr i}} {{")
-    if descending:
-        # 降序：先在双引号外算好倒序下标（这里是真命令替换，合法），
-        # 上面的路径转义里用 \[$v\] 引用它。
-        out.append(f"    set v [expr {{{group['end']} - $i}}]")
-    out.extend(assigns)
-    out.append(f"    set_scan_segment {name} -lockup_exists false \\")
-    out.append(f"        -access [list {' '.join(acc)}]")
-    out.append("}")
-    return out
-
-
-def _expanded_segment_lines(chains, name_prefix, base):
-    # 路径中方括号**不转义**。dftexp_scan 是自制解析器（容器内 puts 实测）：
-    #   `\[55\]` -> Invalid command name '55\'（不支持反斜杠转义，必错）
-    #   `[55]`   -> 字面保留（纯数字下标不做命令替换，安全）
-    #   `[$v]`   -> $v 替换后字面保留（安全）
-    # 官方 golden 正是未转义写法。注意这与标准 tclsh 行为不同，
-    # _segment_loop_test.py 里已按工具语义做模拟展开比对。
+    chains = [c for c in (facts.get("shift_chains") or []) if c["length"] >= min_length]
+    if max_chains:
+        chains = chains[:max_chains]
     lines = []
     for i, ch in enumerate(chains):
         acc = []
@@ -1965,64 +1398,7 @@ def _expanded_segment_lines(chains, name_prefix, base):
         acc += ["scan_data_in", '"%s"' % ch["si"]]
         acc += ["scan_data_out", '"%s"' % ch["so"]]
         lines.append('set_scan_segment %s%d -lockup_exists false \\\n'
-                     '    -access [list %s]' % (name_prefix, base + i, " ".join(acc)))
-    return lines
-
-
-def segment_commands(facts, min_length=2, name_prefix="seg", max_chains=None,
-                     use_loops=True):
-    """
-    由移位链事实确定性生成 `set_scan_segment` 命令。
-
-    task_spec 要求「所有长移位寄存器均配置为 scan segment，不得拆分」时，正确做法
-    就是把每条链（长度 >= min_length）配成一个 segment，si/se/so 取链首/链尾的真实
-    端口路径 —— **只需要网表事实，不需要 golden**。
-
-    单条写法（手册 2.2.9）：
-        set_scan_segment <name> -lockup_exists false \\
-            -access [list scan_enable <se> scan_data_in <si> scan_data_out <so>]
-
-    **合并成 for 循环**（2026-10-28）：同族链（只有一处下标不同、且连续）合并成
-    一个循环。public/task_1/case6 实测 280 条 -> 5 个循环，dofile 从 52KB 降到 6KB，
-    与官方 golden 的写法一致。合并前做过等价性验证：用 tclsh 展开循环体，
-    逐条字符串与原展开版逐字节相同（tools/_segment_loop_test.py）。
-    任何一条不满足条件就退回逐条展开 —— 宁可文件大，不可写错。
-
-    Returns:
-        (lines: list[str], covered: int)
-    """
-    chains = [c for c in (facts.get("shift_chains") or []) if c["length"] >= min_length]
-    if max_chains:
-        chains = chains[:max_chains]
-    if not use_loops:
-        return _expanded_segment_lines(chains, name_prefix, 0), len(chains)
-
-    # 按签名归组（保持首次出现顺序）
-    buckets = {}
-    for ch in chains:
-        buckets.setdefault(_seg_shape(ch), []).append(ch)
-
-    lines, base = [], 0
-    for members in buckets.values():
-        rest = list(members)
-        while rest:
-            group = _loop_group(rest)
-            if group and group["count"] >= _SEG_LOOP_MIN:
-                need = group["count"]
-                # 按变化下标升序取前 need 条（同族链在事实里通常已连续排列）
-                ordered = sorted(rest, key=lambda c: _seg_nums(_unwrap(c.get("si")))[0]
-                                 if _seg_nums(_unwrap(c.get("si"))) else 0)
-                picked = ordered[:need]
-                if len(picked) == need and _loop_group(picked):
-                    lines.extend(_loop_lines(picked, group, name_prefix, base))
-                    base += need
-                    for c in picked:
-                        rest.remove(c)
-                    continue
-            # 无法合并：这一条单独展开
-            lines.extend(_expanded_segment_lines([rest[0]], name_prefix, base))
-            base += 1
-            rest.pop(0)
+                     '    -access [list %s]' % (name_prefix, i, " ".join(acc)))
     return lines, len(chains)
 
 

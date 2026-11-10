@@ -34,11 +34,6 @@ def _load_dotenv():
       3) 仓库根目录 .env（submission/ 的上一级）
       4) submission/ 同目录 .env
     """
-    # 测试隔离用：置 1 时完全不读 .env（否则用例目录里的 .env 会污染
-    # 「全缺」这类断言 —— 明明清空了环境变量，却被 .env 又填回来）。
-    if os.environ.get("SCAN_AGENT_NO_DOTENV") == "1":
-        return
-
     candidates = []
     explicit = os.environ.get("SCAN_AGENT_ENV")
     if explicit:
@@ -133,12 +128,10 @@ def _env_first(*names):
 # ---------------------------------------------------------------------------
 # 地址与模型名的默认值 —— **与官方参考实现一致**
 # ---------------------------------------------------------------------------
-# 官方 `赛题二更正材料1012/reference_submission/submission/scan_agent.py`（2026-10-25 版）原文：
+# 官方 `reference_submission02/submission/scan_agent.py` 原文：
 #     "api_key":  os.environ.get("LLM_API_KEY",  "sk-your-api-key-here"),
 #     "base_url": os.environ.get("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-#     "model":    os.environ.get("LLM_MODEL",    "deepseek-v4-pro-0813"),
-# 注意模型名**带 -0813 后缀**：旧参考包写的是 `deepseek-v4-pro`，新版改成
-# `deepseek-v4-pro-0813`。平台若不注入 LLM_MODEL，用旧名字可能直接 404。
+#     "model":    os.environ.get("LLM_MODEL",    "deepseek-v4-pro"),
 # 也就是说：**参赛队只需要提供 key**，地址与模型名由主办方固定、可作默认值。
 #
 # 这条推翻了本文件早前「删光所有默认值」的做法（当时为了 8.1「不要写死地址/模型」）。
@@ -147,7 +140,7 @@ def _env_first(*names):
 # 现在按参考实现补回默认值；关键是**key 仍然没有默认值**（必须注入），
 # 所以「容器无公网时乱连公网地址」的风险并不成立：没 key 就不建客户端。
 _DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-_DEFAULT_MODEL = "deepseek-v4-pro-0813"
+_DEFAULT_MODEL = "deepseek-v4-pro"
 
 
 LLM_CONFIG = {
@@ -162,17 +155,14 @@ LLM_CONFIG = {
     # 同时要求 LLM 对重复结构用 for 循环（见 generate_dofile_with_llm 的 prompt），
     # 实际输出通常远小于该上限，放宽只是兜底。
     #
-    # 【2026-10-26 修正：旧注释「加大上限本身不增加耗时」是错的】
-    # 对推理模型，max_tokens 不是「天花板」，而是**思考预算闸门** —— 思考 token
-    # 也计入其中，所以它直接决定单次调用要烧多久。同一 prompt（5574 tokens）、
-    # 同一模型，实测：
-    #     max_tokens= 4000 ->  61.1s，reasoning 4000，正文 0 字符（被思考吃光）
-    #     max_tokens=30000 -> 260.2s，reasoning 16451，正文 1437 字符
-    # 下调上限并不能省时间，只会把正文截成空；真正省时靠两件事：
-    #   1) 精简 prompt（system prompt 2862 -> 757 字符，少让它逐条自检）；
-    #   2) 流式守护（llm_client._STREAM_GUARD_RATIO）：没正文就提前收手。
-    # 因此这里仍给足上限，避免「预算够但被截断」；时间约束交给上面两条。
-    "max_tokens": int(os.environ.get("SCAN_AGENT_LLM_MAX_TOKENS", "30000")),
+    # 【2026-10-10 提到 30000】deepseek-v4-pro 是推理模型，思考 token **计入**
+    # max_tokens。平台上单次调用实测 78~148s（比本地 48~107s 慢一个量级），
+    # 对应的 reasoning 规模也远超本地实测的 2000+ —— 20000 会被思考吃光、
+    # 返回 finish_reason=length 且正文为空，然后白白触发一次「放大上限重试」
+    # （再多花 80~150s，而 llm_client._REASONING_RETRY_CAP 已是 30000，
+    # 重试用的还是同一个值）。直接把默认值给到上限，让第一次调用就能正常返回。
+    # 加大上限本身不增加耗时：max_tokens 只是天花板，模型正常会提前停止。
+    "max_tokens": 30000,
     "temperature": 0.2,  # 生成 dofile 需要确定性，用较低温度
 }
 
@@ -204,28 +194,6 @@ LLM_CONFIG = {
 # 另外默认**不自动重试**（重试等于时长翻倍，150s 预算扛不住）。
 # 只有在「本阶段剩余时间连一次调用都放不下」时才跳过 LLM，此时属客观来不及，
 # 流程走确定性路径（规则模板 / spec_fixer），已由 _e2e_dryrun / _hidden_sim 验证。
-# ---------------------------------------------------------------------------
-# 思考模式控制（2026-10-27 查文档确认，这是此前一直漏掉的一环）
-# ---------------------------------------------------------------------------
-# 阿里云百炼文档原文：
-#   · 「deepseek-v4.1-flash、deepseek-v4-pro、deepseek-v4-flash-0731 和
-#      deepseek-v4-pro-0813 **默认开启思考模式**」
-#   · 「通过 enable_thinking 参数在思考与非思考模式之间切换」
-#   · 「reasoning_effort 可调推理强度，可选 low（仅 …/deepseek-v4-pro-0813 支持）、
-#      high、max，默认 high」
-#
-# 也就是说：我们一直没传 enable_thinking，模型就按默认「开思考 + high 强度」跑，
-# 单次调用实测 reasoning 16451 tokens / 260s —— 这不是模型慢，是我们没关。
-#
-# 默认关闭思考：dofile 计划属于「读规格 + 填结构化字段」，不是需要长链推理的题；
-# 关掉后同一 prompt 从 260s 降到个位数秒量级。若发现质量下降，可：
-#   LLM_ENABLE_THINKING=1                打开思考（回到旧行为）
-#   LLM_REASONING_EFFORT=low             保留思考但降强度（快很多）
-# 若网关/模型不接受该参数，llm_client 会自动去掉并重试（见 _THINKING_UNSUPPORTED）。
-LLM_ENABLE_THINKING = (os.environ.get("LLM_ENABLE_THINKING", "0").strip()
-                       not in ("0", "false", "False", "no", ""))
-LLM_REASONING_EFFORT = (os.environ.get("LLM_REASONING_EFFORT", "") or "").strip()
-
 LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "240"))
 LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "0"))
 
@@ -280,22 +248,12 @@ LICENSE_SERVER = os.environ.get("SCANINSERTION_LICENSE_SERVER", "")
 DFTEXP_SCAN = os.environ.get("DFTEXP_SCAN", "dftexp_scan")
 YOSYS = os.environ.get("YOSYS", "/opt/oss-cad-suite/bin/yosys")
 EQY = os.environ.get("EQY", "/opt/oss-cad-suite/bin/eqy")
-# 官方参考链用的 BMC 引擎（赛题二更正材料1012/task2-case6/yosys/run.sh）
-BTORMC = os.environ.get("BTORMC", "/opt/oss-cad-suite/bin/btormc")
 
 # 工具单轮运行超时（秒）
 TOOL_TIMEOUT = int(os.environ.get("TOOL_TIMEOUT", "120"))
 
 # 最大修复轮数
-#
-# 【2026-10-28 从 6 降到 3】评分维度包含总时长（目标：全部 case 累计 ≤1200s）。
-# 旧值 6 的依据是"dofile 靠规则模板生成、错误多，需要反复试错"；现在
-# LLM 决策 + 规则校验把关，首轮产物质量显著提高（public 用例首轮即与 golden
-# 语义一致），继续保留 6 轮的代价是**每个 case 多烧 3 轮工具时间** ——
-# 小网表 40~60s/轮、大网表 300~400s/轮，光重试就能吃掉上千秒。
-# 3 轮 = 首轮 + 两次修复机会：实测 90% 的收敛发生在前两轮，
-# 且循环内还有「错误数不降就止损」的保护（见 run_task1 的 best_errors）。
-MAX_RUNS = int(os.environ.get("MAX_RUNS", "3"))
+MAX_RUNS = int(os.environ.get("MAX_RUNS", "6"))
 
 
 def llm_available() -> bool:
@@ -311,28 +269,6 @@ def llm_available() -> bool:
     key = LLM_CONFIG["api_key"]
     return bool(key) and key != "sk-your-api-key-here" \
         and bool(LLM_CONFIG["base_url"]) and bool(LLM_CONFIG["model"])
-
-
-def llm_block_reason() -> str:
-    """
-    LLM 不可用的**具体原因**（可用时返回空串）。
-
-    为什么单独提供：`llm_available()` 只看 key，SDK 未安装时它仍返回 True，
-    启动横幅于是打印「LLM: 可用」——2026-11-02 一批 10 个 case 的测试就是这样：
-    横幅写着可用、实际 0 次调用（`_HAS_OPENAI` 为 False，client 根本没构造），
-    整批结果被误读成「代码能力不行」。这里把原因显式化。
-    """
-    if not LLM_CONFIG["api_key"] or LLM_CONFIG["api_key"] == "sk-your-api-key-here":
-        return "未注入 LLM_API_KEY"
-    if not LLM_CONFIG["base_url"]:
-        return "未配置 base_url"
-    if not LLM_CONFIG["model"]:
-        return "未配置 model"
-    try:
-        import openai  # noqa: F401
-    except ImportError:
-        return "openai SDK 未安装"
-    return ""
 
 
 def tool_available() -> bool:

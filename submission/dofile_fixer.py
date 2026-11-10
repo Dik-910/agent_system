@@ -235,16 +235,6 @@ def build_error_context(dofile_text, parsed, located_lines, task):
         parts.append(f"- {err}")
     if parsed.get("total_violations"):
         parts.append(f"\nDRC 违例总数: {parsed['total_violations']}")
-        # 按规则号分组：只给总数，LLM 无法判断根因（例如「DFTR1 上万条」意味着
-        # 整体时钟不可控，而「DFTR10 几条」只是个别时钟接到数据端）。
-        # 这是让 LLM 在**未知新 case** 上自行定位的关键信息，必须给出。
-        rules = parsed.get("drc_rules") or {}
-        if rules:
-            top = sorted(rules.items(), key=lambda kv: -kv[1])[:8]
-            parts.append("DRC 按规则分布: "
-                         + "、".join(f"{r}×{n}" for r, n in top))
-            parts.append("（规则含义见手册 2.1.3.1：DFTR1/2/3 时钟/置位/复位不可控，"
-                         "DFTR9 时钟在测试态不可活动，DFTR10 时钟接到数据端…）")
 
     # 2. 定位到的命令行（含上下文）
     if located_lines:
@@ -430,272 +420,71 @@ def generate_spec_patch_with_llm(task, current_dofile, issues, llm):
     return None
 
 
-# 工具在插链流程里**自己生成**的 net 名：`insert_dft_logic` 之后才存在。
-# ECO 阶段（插链前）引用它们必然失败 —— `-from test_se` 报 COM-3008。
-_TOOL_NET_RE = re.compile(
-    r"(?i)^(?:test_(?:se|si|so)\d*|scan_(?:se|en|si|so)\d*|"
-    r"subscanchain_\w+|scan_chain_\w+)$")
-_DECL_PORT_RE = re.compile(r"(?:-port|add_port)\s+\{?([\w./\[\]]+)\}?")
-
-
-def _drop_unknown_eco_refs(dofile_text):
-    """
-    删掉 `connect_pin -from <工具内部 net>` 这种**必然报错**的 ECO 行。
-
-    2026-11-01（测试17 / task_2/case6）：LLM 补丁在 R2→R3 之间加了一行
-        connect_pin -from test_se -to u_pwm/clk_gate_pwm/SCE
-    `test_se` 是 `insert_dft_logic` 之后才生成的内部 net，ECO 阶段不存在，
-    工具直接报 `[ERROR] [COM-3008] Nothing matched for '-from'`，R3 整轮白跑
-    （平台仍判通过，因为 exit code 是 0 —— 属于"跑了一遍但什么都没做"）。
-
-    判据收窄到「名字明显是工具生成的 net」且「dofile 里没有声明过该端口」，
-    不去猜网表里的真实 net，避免误删合法 ECO。
-    """
-    text = dofile_text or ""
-    # declared 只能算**在 ECO 之前**就已经存在的端口：
-    # 实测 R3.dofile 里 `connect_pin -from test_se` 在第 31 行，而
-    # `set_scan_signal -type scan_enable -port test_se` 在第 47 行 ——
-    # 工具执行到第 31 行时 test_se 还没被创建，照样报 COM-3008。
-    lines = text.splitlines()
-    eco_start = len(lines)
-    for i, ln in enumerate(lines):
-        if re.match(r"\s*(?:disconnect_net|add_inst|connect_net)\b", ln):
-            eco_start = i
-            break
-    prefix = "\n".join(lines[:eco_start])
-    declared = {m.group(1) for m in _DECL_PORT_RE.finditer(prefix)}
-    # ECO 块自己的 add_port 是有效的（就在同一块里，先建后用）
-    declared |= {m.group(1) for m in re.finditer(r"add_port\s+\{?([\w./\[\]]+)\}?", text)}
-    out, dropped = [], []
-    for ln in lines:
-        m = re.match(r"\s*connect_pin\b[^\n]*-from\s+(\S+)", ln)
-        if m:
-            ref = m.group(1).strip("{}")
-            if _TOOL_NET_RE.match(ref) and ref not in declared:
-                dropped.append(ref)
-                continue
-        out.append(ln)
-    for r in dropped[:3]:
-        print(f"  ⚠ 删除引用工具内部 net 的 ECO 行：-from {r}"
-              f"（插链前不存在，会报 COM-3008）")
-    if dropped:
-        return "\n".join(out) + ("\n" if text.endswith("\n") else "")
-    return text
-
-
-def _block_span(lines, idx):
-    """
-    把第 idx 行扩展到它所属的**整个 Tcl 逻辑语句**（续行 + `{`…`}` 跨行块）。
-
-    为什么必须有（2026-11-01，新 case ex3 首跑实测）：
-      `set_scan_signal -type clock -port clk -off_state 2 \\` 这种三行块，
-      按行 replace 只换掉首行，中间的
-      `    -associated_internal_clocks {\\ u_clk_latch/Q \\}` 留在文件里，
-      工具当成独立命令 → `[CMD-0074]`，整个流程停在 DRC 之前（0 条链、无 DRC）。
-      删除同理：只删首行会留下一堆孤儿续行。
-
-    返回 (start, end)（左闭右开），只向**后**扩展 + 必要时向前回退续行链。
-    """
-    if not lines:
-        return idx, idx + 1
-    idx = max(0, min(idx, len(lines) - 1))
-
-    # 1) 向前：只要上一行以续行反斜杠结尾，当前行就是同一条语句的一部分
-    start = idx
-    for _ in range(64):                       # 防御：异常输入时不死循环
-        if start == 0:
-            break
-        if lines[start - 1].rstrip().endswith("\\"):
-            start -= 1
-        else:
-            break
-
-    # 2) 向后：行尾续行 or {} 未配平就继续吞
-    end = idx + 1
-    depth = 0
-    for i in range(start, end):
-        depth += lines[i].count("{") - lines[i].count("}")
-    while end < len(lines):
-        if depth > 0 or lines[end - 1].rstrip().endswith("\\"):
-            depth += lines[end].count("{") - lines[end].count("}")
-            end += 1
-        else:
-            break
-    return start, end
-
-
-# 受保护的声明行：删掉会引发大面积违例，只允许「改值」不允许「删行」
-_PROTECTED_DECL_RE = re.compile(
-    r"^[ \t]*(?:set_scan_signal[ \t]+-type[ \t]+(?:clock|reset)\b"
-    r"|set_scan_cell_mapping\b)")
-
-# 题面允许「不声明」的口径（官方 task_2/case1 原文：resetn 为低有效异步复位…无需配置 reset 扫描信号）
-_DECL_WAIVER_RE = re.compile(
-    r"无需配置|无需声明|不需要配置|不需要声明|不必配置|不必声明|"
-    r"不参与扫描|不作为扫描|不纳入扫描|禁止声明")
-
-
-def _decl_delete_blocked(line_text, task):
-    """
-    删除/清空一条「时钟 / 复位 / 映射」声明前，判断是否该拦。
-
-    2026-11-03 第六批报告 P0-1：某多时钟域 case 的时钟端口名笔误（少后缀），
-    agent 第一轮诊断与修复**都正确**，但修复后 DRC 没清零（该设计还有其它独立缺陷），
-    于是它把「DRC 未清零」误归因为「我上次改错了」，**把正确的时钟声明整行删掉** ——
-    该时钟域彻底不声明，DFTR1 涨到上万条，链数从几十条塌到 2 条。
-    也就是说：正确诊断最终产出错误结果，且日志里看不出来（诊断记录是对的）。
-
-    这里加一道硬约束：端口在网表里真实存在、且题面没有「无需配置」这类豁免时，
-    拒绝删除该声明行 —— 想改就改值（`_fix_scan_signals` 的纠错路径），不能删行。
-
-    Returns:
-        True 表示应当拦截。
-    """
-    if not _PROTECTED_DECL_RE.match(line_text or ""):
-        return False
-    m = re.search(r"-port[ \t]+(\S+)", line_text or "")
-    port = m.group(1) if m else ""
-    spec = (task or {}).get("task_spec", "") or ""
-    if port and spec:
-        # 题面在这个端口附近明说不用声明 -> 允许删（t2/c1 的 resetn 就是这种）
-        for mm in re.finditer(r"(?<![\w])%s(?![\w])" % re.escape(port), spec):
-            seg = spec[max(0, mm.start() - 80):mm.end() + 80]
-            if _DECL_WAIVER_RE.search(seg):
-                return False
-    return True
-
-
-def apply_patch(dofile_text, fixes, report=None, task=None):
+def apply_patch(dofile_text, fixes):
     """
     把补丁应用到 dofile，返回新 dofile 文本。
-
-    2026-11-01 两处修正（都来自新 case 的实测）：
-      ① **按逻辑语句**替换/删除，不再只动一行 —— 续行块按行换会留残行（CMD-0074）。
-      ② target 找不到时**不再静默丢弃**，而是记进 report["missed"]。
-         旧实现直接 `continue`，于是「LLM 说改了 8 条、产物里一条没变」，
-         决策记录却标着问题已识别 —— 看对了没改对，属于最坏的一类失败。
 
     Args:
         dofile_text: 原 dofile
         fixes: 补丁列表（LLM 输出）
-        report: 可选 dict，回填 {"applied": [...], "missed": [...]}
 
     Returns:
         str: 修复后的 dofile
     """
-    rep = report if report is not None else {}
-    rep.setdefault("applied", [])
-    rep.setdefault("missed", [])
     if not fixes:
         return dofile_text
 
     lines = dofile_text.splitlines(keepends=True)
+    # 逐条应用（从后往前处理行号，避免行号偏移；这里按子串定位，用一次性扫描更稳）
 
-    # 先把每个 fix 定位到**语句块**
+    # 先把每个 fix 定位到行号
     resolved = []
     for fix in fixes:
-        target = (fix.get("target") or "").strip()
+        target = fix.get("target", "")
         action = fix.get("action", "replace")
         content = fix.get("content", "")
 
+        # 找到 target 所在行
         line_no = None
-        if target:
-            for i, line in enumerate(lines):
-                if target in line:
-                    line_no = i
-                    break
+        for i, line in enumerate(lines):
+            if target and target in line:
+                line_no = i
+                break
+
         if line_no is None:
-            rep["missed"].append({
-                "target": target[:120],
-                "action": action,
-                "reason": "target 在 dofile 中找不到",
-            })
+            # 找不到 target，跳过
             continue
 
-        start, end = _block_span(lines, line_no)
         resolved.append({
-            "start": start,
-            "end": end,
+            "line_no": line_no,
             "action": action,
             "content": content,
             "reason": fix.get("reason", ""),
-            "target": target[:120],
         })
 
-    # 按起始行从后往前应用，避免偏移
-    resolved.sort(key=lambda x: -x["start"])
+    # 按行号从后往前应用，避免偏移
+    resolved.sort(key=lambda x: -x["line_no"])
     for r in resolved:
-        start, end = r["start"], r["end"]
-        action, content = r["action"], r["content"]
-        if content and not content.endswith("\n"):
+        ln = r["line_no"]
+        action = r["action"]
+        content = r["content"]
+        if not content.endswith("\n"):
             content += "\n"
 
         if action == "delete":
-            blocked = [ln for ln in lines[start:end]
-                       if _decl_delete_blocked(ln, task)]
-            if blocked:
-                # 不删、不改，记进 blocked 供上层汇报 —— 静默跳过会让
-                # 「诊断说改了、产物没改」再次不可见（r51 已踩过一次）。
-                rep.setdefault("blocked", []).append({
-                    "target": r["target"], "action": action,
-                    "reason": "受保护声明（时钟/复位/映射），禁止删行，只能改值",
-                })
-                print("  ⚠ 拒绝删除受保护的声明行（应改值而非删行）："
-                      + blocked[0].strip()[:80])
-                continue
-            del lines[start:end]
-            rep["applied"].append({"target": r["target"], "action": "delete"})
+            del lines[ln]
         elif action == "replace":
-            # 把受保护声明「换成空白/换成别的东西」等价于删除，同样拦。
-            _old_blk = "".join(lines[start:end])
-            if _decl_delete_blocked(_old_blk, task) and \
-                    not _PROTECTED_DECL_RE.match(content or ""):
-                rep.setdefault("blocked", []).append({
-                    "target": r["target"], "action": action,
-                    "reason": "受保护声明被替换为非声明内容（等价删行）",
-                })
-                print("  ⚠ 拒绝把受保护声明替换成非声明内容：" + _old_blk.strip()[:80])
-                continue
-            # 保留原首行的缩进风格（若 content 未带缩进，则继承）
-            indent = re.match(r"\s*", lines[start]).group(0)
+            # 保留原行的缩进风格（若 content 未带缩进，则继承原行缩进）
+            indent = re.match(r"\s*", lines[ln]).group(0)
             if content.lstrip() == content and indent:
                 content = indent + content
-            lines[start:end] = [content]
-            rep["applied"].append({"target": r["target"], "action": "replace"})
+            lines[ln] = content
         elif action == "insert_after":
-            lines.insert(end, content)
-            rep["applied"].append({"target": r["target"], "action": "insert_after"})
+            lines.insert(ln + 1, content)
         elif action == "insert_before":
-            lines.insert(start, content)
-            rep["applied"].append({"target": r["target"], "action": "insert_before"})
+            lines.insert(ln, content)
 
-    # ── 落地校验：声称改了 ≠ 真的改了 ─────────────────────────────────────
-    # 2026-11-01 多源实测（官方公开 case 的 t2/c6、两套 AI 变体 case）：
-    # decision_log 里"定位对、决策对"，final.dofile 里却原样保留 —— 全部是
-    # 「补丁应用环节静默失败」。这里对每条动作做**应用后回读**：
-    #   · delete   —— target 行必须从结果里消失；
-    #   · replace/insert_* —— content 的关键内容必须出现在结果里。
-    # 未通过的记入 missed，让上层能发现"修了个寂寞"，而不是空欢喜。
-    new_text = "".join(lines)
-    for r in resolved:
-        target, action, content = r["target"], r["action"], r["content"]
-        if action == "delete":
-            if any(target in ln for ln in new_text.splitlines()):
-                rep["missed"].append({
-                    "target": target[:120], "action": action,
-                    "reason": "应用后 target 行仍存在（可能被后续动作恢复或有多处副本）",
-                })
-        elif content:
-            # 取 content 的首个非空、非纯注释行做存在性检查
-            core = next((ln.strip() for ln in content.splitlines()
-                         if ln.strip() and not ln.strip().startswith("#")), "")
-            if core and core not in new_text:
-                rep["missed"].append({
-                    "target": target[:120], "action": action,
-                    "reason": f"应用后未找到期望内容：{core[:80]}",
-                })
-
-    return new_text
+    return "".join(lines)
 
 
 def targeted_fix(task, current_dofile, parsed, llm, diagnosis=None):
@@ -720,19 +509,7 @@ def targeted_fix(task, current_dofile, parsed, llm, diagnosis=None):
     if not fixes:
         return current_dofile
 
-    report = {}
-    new_dofile = apply_patch(current_dofile, fixes, report=report, task=task)
-    if report.get("blocked"):
-        # 被硬约束拦下的补丁（禁止删时钟/复位/映射声明）。单独汇总一条，
-        # 便于事后判断是不是「LLM 想用删行来掩盖 DRC 未清零」。
-        print(f"  ⚠ 补丁有 {len(report['blocked'])} 条被安全约束拦下（未执行）")
-    if report.get("missed"):
-        # 旧实现静默丢弃：LLM 说改了 8 条、产物一条没变，决策记录却标"已识别"。
-        # 现在至少让它可见，便于判断"是补丁写错"还是"定位方式不对"。
-        print(f"  ⚠ 补丁有 {len(report['missed'])} 条 target 未命中（已跳过）")
-        for m in report["missed"][:3]:
-            print(f"      - {m['action']}: {m['target'][:70]}")
-    new_dofile = _drop_unknown_eco_refs(new_dofile)
+    new_dofile = apply_patch(current_dofile, fixes)
 
     # 3. 命令白名单校验：补丁不得引入非法命令（防止 LLM 脑补命令名，越修越糟）
     new_violations = dofile_generator.validate_dofile_commands(new_dofile)
@@ -789,16 +566,7 @@ def targeted_spec_fix(task, current_dofile, spec_issues, llm):
     if not fixes:
         return current_dofile
 
-    report = {}
-    new_dofile = apply_patch(current_dofile, fixes, report=report, task=task)
-    if report.get("blocked"):
-        print(f"  ⚠ 规格补丁有 {len(report['blocked'])} 条被安全约束拦下（未执行）")
-    if report.get("missed"):
-        # 落地校验失败 = "决策记录里改了、文件里没改"，评分口径下属于最坏失败，
-        # 必须让上层看见（否则 verify 回填还会标 resolved=true）。
-        print(f"  ⚠ 规格补丁有 {len(report['missed'])} 条未真正落地（已记录）")
-        for m in report["missed"][:3]:
-            print(f"      - {m['action']}: {m.get('reason', m['target'][:60])}")
+    new_dofile = apply_patch(current_dofile, fixes)
     if new_dofile == current_dofile:
         return current_dofile
 
@@ -900,32 +668,6 @@ def rule_based_fix(task, current_dofile, parsed):
 
     # 规则4：-active_state 是非选项 → 移除
     fixed = re.sub(r"\s*-active_state\s+\w+", "", fixed)
-
-    # 规则4.5：`-associated_internal_clocks` 指向的 pin 不存在（SCAN-1620）
-    # → 删掉这个参数，回到"不声明"。
-    #
-    # 2026-11-02 变体 case 报告（P0-1）：LLM 把时钟缓冲单元的**实例名**当成其输出的
-    # **时钟路径**写进 -associated_internal_clocks，工具报
-    #   [ERROR] [SCAN-1620] ... does not exist
-    #   [ERROR] [CMD-0074] 命令执行失败
-    # 整条 set_scan_signal 失败 → 后面的 scan_enable/复位/常量全没配上 →
-    # 最终连 post_scan 网表都没有，整 case 归零。
-    # 这里做**确定性兜底**：既然路径猜错时"不填"远远好过"填错"，只要日志里
-    # 的 SCAN-1620 点名了某个我们写进去的关联时钟路径，就把该参数摘掉。
-    _errs = " ".join(str(e) for e in ((parsed or {}).get("errors") or []))
-    if "SCAN-1620" in _errs:
-        _bad = {m.group(1).strip() for m in
-                re.finditer(r"-associated_internal_clocks\s+\{([^}]*)\}", fixed)}
-        _bad |= {m.group(1).strip() for m in
-                 re.finditer(r'-associated_internal_clocks\s+"([^"]*)"', fixed)}
-        # 日志没点名具体 pin 时也删：这个参数是唯一的"可选 pin 引用"，
-        # 而 SCAN-1620 的语义就是"引用的 pin 不存在"。
-        if not _bad or any(b and b in _errs for b in _bad):
-            _before = fixed
-            fixed = re.sub(r"\s+-associated_internal_clocks\s+\{[^}]*\}", "", fixed)
-            fixed = re.sub(r'\s+-associated_internal_clocks\s+"[^"]*"', "", fixed)
-            if fixed != _before:
-                print("  ↻ SCAN-1620：移除猜测的 -associated_internal_clocks（宁可不填）")
 
     # 规则5：set_scan_cell_mapping 误用 -dff/-sff 选项 → 转成两个位置参数
     # 正确形式：set_scan_cell_mapping <dff_cell> <sff_cell>（无选项）

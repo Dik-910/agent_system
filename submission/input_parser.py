@@ -295,106 +295,65 @@ def _derive_case_id(input_dir, top_module=""):
 # LLM 抽取结构化任务理解
 # ============================================================================
 
-def extract_task_understanding(task, llm, thinking=True):
+def extract_task_understanding(task, llm):
     """
     利用 LLM 从 task_spec 抽取结构化配置，返回 dict。
-
-    Args:
-        thinking: 本次调用是否开思考。默认 True（语义理解需要推理）；
-            调用方在预算窗口紧张时传 False 走快档（实测 62~68s → 6~7s）。
     LLM 不可用时返回 None（由调用方走规则兜底）。
     """
     if not llm.available:
         return None
 
     system_prompt = """你是广立微 dftexp_scan 工具（Scan Insertion）专家。
-从任务说明书中抽取生成 dofile 所需的结构化配置，按 JSON 返回。
+请从任务说明书中抽取生成 dofile 所需的全部结构化信息，严格按 JSON 返回。
 
-## 输出字段（下面用「<说明>」表示此处应填的值，**不要照抄说明文字**）
-
+输出 JSON 结构：
 {
-  "top_module": "<顶层模块名>",
-  "lib_files": ["<相对 input 目录的库文件路径>"],
-  "netlist_files": ["<相对 input 目录的网表文件路径>"],
-  "ctl_files": [{"file": "<ctl 路径>", "module": "<关联模块名>"}],
-  "scan_cell_mappings": [["<dff 单元名>", "<sff 单元名>"]],
-  "clock_signals": [{"port": "<顶层端口名>", "associated_internal_clocks": [], "pseudo_pi": [], "off_state": null}],
-  "reset_signals": [{"port": "<顶层端口名>", "off_state": null}],
-  "constant_signals": [{"port": "<顶层端口名>", "value": <0 或 1>}],
-  "scan_enable_signals": [{"port": "<顶层端口名>", "usage": "<all 或 scan>", "off_state": null}],
-  "scan_element_exclude": ["<对象路径>"],
-  "icg_exclude_elements": ["<模块名>"],
-  "scan_cfg": {"<选项名>": "<该选项的取值>"},
-  "wrapper_cfg": {"enabled": true, "style": "<样式名>", "reuse_threshold": <整数>,
-                  "depth_threshold": <整数>, "dedicated_cell": "<单元名>"},
-  "scan_segments": [{"name": "<段名>", "si": "<输入端口>", "se": "<使能端口>", "so": "<输出端口>"}],
-  "drc_rules": {"ignore": ["<规则号>"], "allow": ["<规则号>"]},
-  "pseudo_pi": ["<端口路径>"],
-  "wrapper_signals": [{"type": "<wrapper_clock|wrap_in_shift_en|wrap_out_shift_en|wrap_capture_en>", "port": "<端口名>"}],
-  "outputs": {"netlist": "<输出网表文件名>", "ctl": "<ctl 文件名或空串>", "scandef": "<scandef 文件名或空串>"},
-  "workflow": ["full_scan"]
+  "top_module": "顶层模块名",
+  "lib_files": ["库文件相对路径1", "..."],
+  "netlist_files": ["网表文件相对路径1", "..."],
+  "ctl_files": [{"file": "ctl路径", "module": "关联模块名"}],
+  "scan_cell_mappings": [["dff类型", "sff类型"], ...],
+  "clock_signals": [{"port": "时钟端口", "off_state": null, "role": "scan_clock或described_only", "associated_internal_clocks": ["..."], "pseudo_pi": ["..."]}, ...],
+  "reset_signals": [{"port": "复位端口", "off_state": null, "role": "scan_reset或described_only"}, ...],
+  "constant_signals": [{"port": "端口", "value": 0或1}, ...],
+  "scan_enable_signals": [{"port": "端口", "usage": "scan/clock_gating/all", "off_state": null}, ...],
+  "scan_element_exclude": ["需要 set_scan_element false 的对象路径"],
+  "icg_exclude_elements": ["不参与 ICG 重连的模块"],
+  "scan_cfg": {"chain_count": 0, "max_length": 0, "mix_clocks": null, "mix_edges": null, "internal_clocks": null, "si_port_format": "", "so_port_format": "", "add_lockup": null},
+  "wrapper_cfg": {"enabled": false, "style": "", "chain_count": 0, "max_length": 0, "port_specific": [], "reuse_threshold": 0, "depth_threshold": 0, "dedicated_cell": null},
+  "scan_segments": [{"name": "", "si": "", "se": "", "so": ""}],
+  "drc_rules": {"ignore": ["DFTR-TIE1", "DFTR-TIE0"], "allow": ["DFTR10"]},
+  "pseudo_pi": ["需要 add_pseudo_pi 的路径"],
+  "wrapper_signals": [{"type": "wrapper_clock/wrp_in_shift_en/...", "port": ""}],
+  "outputs": {"netlist": "输出网表文件名", "ctl": "ctl文件名或空", "scandef": "scandef文件名或空"},
+  "workflow": ["connect_icg_only", "replace_only", "replace_unscan"] 或 ["full_scan"],
+  "chain_count": 0
 }
 
-**重要的书写约定**：上面 `<...>` 里的内容是你必须替换掉的说明。
-任务书**没有给出**的字段，整个键都不要写（或给空数组 []），
-**绝对不要**为了"填满结构"而编一个数字或枚举值 —— 工具会把它当真配置执行。
+【关键约束——区分"描述"与"配置要求"】
+task_spec 中可能包含两类关于信号的描述：
+  (A) 描述性段落：如"时钟结构"表格、"复位信号"列表、"端口说明"、"网表说明"等——
+      这些只是在介绍设计，**不是**要求你配置 set_scan_signal。
+  (B) 明确要求：如"DFT 控制信号"表格、或明确说"配置 xxx 为 scan_enable /
+      scan clock / scan reset / 用于 xxx"——这些才需要配置。
 
-## 填值规则（按信号类型分开，**不要一律照抽**）
+严格规则：
+- 只有 (B) 类信号才能填入 clock_signals / reset_signals / scan_enable_signals，
+  且 role 值填对应的 "scan_clock" / "scan_reset" / "scan_enable"。
+- (A) 类信号一律不要抽取。如果无法确定，宁可不抽取。
+- off_state 字段默认值为 null（不是 0），只有 task_spec 明确说明其取值时才填具体数字。
+- 不要添加 task_spec 未明确要求的 -off_state / -usage 参数。
 
-**clock_signals —— 凡任务书提到的顶层时钟都要配。**
-工具必须知道用哪个时钟做移位，所以无论任务书是写在"DFT 控制信号"表里、
-还是只在"时钟结构"段落里描述，只要它是顶层时钟端口就填进来。
+【drc_rules 字段（严格，宁可留空也不要编）】
+- 只有当 task_spec **明确要求**「忽略 / 豁免某 DRC 规则」时才填入 ignore。
+- 规则号必须逐字取自 task_spec 原文，且只能是手册 2.1.3.3 认可的写法：
+  DFTR1-DFTR17、DFTR-TIE0、DFTR-TIE1、DFTR-L1、DFTR-L2。
+- 严禁编造、补全或使用占位符（如 DFTR-XXX、DFTRx、缺 DFTR- 前缀的 TIE1）。
+- 若 task_spec 只说「允许遗留 / 无需处理某违例」（例如 DFTR10），不要填入
+  ignore —— 那是允许残留，不是要求忽略；这种情况填 []。
+- 没有明确要求时统一填 []。
 
-**scan_enable_signals —— 任务书指定作扫描使能的端口都要配。**
-
-**reset_signals —— 默认不要填。**
-这是最容易错的地方：任务书里常有一段「复位信号」列表（"pad_cpu_rst_b — CPU 复位"），
-那是在**介绍设计结构**，不是要求你配置它。工具对复位有默认推断，
-显式声明反而会引入 golden 里并不存在的配置。
-只有任务书**明确要求把某端口配置为扫描复位**（例如"将 xxx 配置为 scan reset"
-"复位在扫描状态下必须保持 0"）才填，并同时给 off_state。
-
-**constant_signals**：任务书明确要求固定电平的端口（如 test_mode 必须拉 0）。
-
-**扫描被排除的信号**（"不参与扫描""仅功能""不接入扫描路径"）：
-不要填进任何 *_signals，按任务书指示放到 scan_element_exclude。
-
-**scan_enable_signals 的 usage**：
-**默认不写这个键。** 只有任务书明确要求某个用途时才填：
-  · 明确说"用于时钟门控"/"控制时钟门控" → `"clock_gating"`；
-  · 明确说"同时用于扫描和时钟门控" → `"all"`。
-不要因为网表里有 ICG 就自行补 `all` —— 工具自己会推导，多写的 -usage
-会变成与参考答案不一致的多余配置。
-
-**off_state**：任务书写明关闭电平（如"关闭状态为 0"）才填 0/1，否则保持 null。
-
-**scan_cfg**：任务书没提到的选项，**省略该键**（不要填 null、不要填 0）。
-  · chain_count：任务书给的链数；只说"不超过 N 条"时填 N。
-  · max_length：单链最大长度。
-  · mix_clocks：单时钟域 → false；要求不同时钟域混插同链 → true。
-  · mix_edges：**只在任务书明确谈到边沿策略时才填**（如"禁止混沿"→ false，
-    "允许正负沿混合"→ true）。任务书没提边沿就省略，不要自行推断。
-  · internal_clocks：时钟经组合逻辑派生内部时钟 → 按扇出填 "single"（单路）或
-    "multi"（多路）；任务书不提内部时钟 → 省略该键。
-  · add_lockup：任务书要求"插入 lockup latch" → true（官方答疑：这就是默认要求）。
-  · insert_terminal_lockup：**只在任务书明确指定 latch 位置（链尾/末端/terminal）时才填**。
-    官方答疑原话：「如果任务书没说明 lockup latch 位置的话，默认要求 -add_lockup」。
-
-**workflow**：完整插链 → ["full_scan"]；
-  只做前置处理（不建链）→ ["connect_icg_only","replace_only","replace_unscan"]。
-
-**drc_rules**：只填任务书**明确要求忽略**的规则号，逐字抄原文，
-  只能是 DFTR1~DFTR17、DFTR-TIE0、DFTR-TIE1、DFTR-L1、DFTR-L2。
-  「允许残留某违例」不等于「要求忽略」—— 这种情况不要填。
-
-## 硬性要求
-
-- 端口名必须是**顶层端口**，不能是内部信号（网表事实里给了顶层端口清单，照它校验）。
-- 只依据任务说明书与输入文件清单，**不要参考任何 golden 参考答案**。
-- `lib_files` / `netlist_files` 用相对 input 目录的路径。
-- 只返回 JSON，不要解释。字段确实不存在于本 case 时用 `[]` / `{}`；
-  **能从任务书读到的信息必须填，不要因为"格式不确定"而留空**。
-"""
+只返回 JSON，不要任何解释。字段值不确定时用 null 或空列表。"""
 
     # 构造相对路径视图（帮助 LLM 生成相对路径）
     files = task["files"]
@@ -404,34 +363,6 @@ def extract_task_understanding(task, llm, thinking=True):
         "ctl": [os.path.relpath(p, task.get("input_dir", ".")) for p in files["ctl"]],
         "def": [os.path.relpath(p, task.get("input_dir", ".")) for p in files["def"]],
     }
-
-    # 网表事实预填：把「设计里客观存在什么」直接告诉模型，省掉它去猜。
-    #
-    # 为什么（2026-10-28，读了开思考的 reasoning 原文才发现的）：
-    # 旧 prompt 让模型自己判断「clk 算不算扫描时钟」，它于是花了两千多字纠结
-    # 「任务书没有明确要求配置」，最后返回 clock_signals=[] —— 任务书明明写了
-    # 「设计为单时钟域，仅有一个顶层时钟端口 clk」。
-    # 这类信息网表事实里已经算出来了，不该让模型猜：给它端口清单和时钟候选，
-    # 它只需要在半成品上做语义标注（哪个当 scan_enable、usage 填什么）。
-    facts = task.get("_facts") or {}
-    ports = facts.get("top_ports") or {}
-    hints = []
-    if ports:
-        hints.append("顶层端口清单（只能从这里选 port）："
-                     + ", ".join(sorted(ports)))
-    if facts.get("clock_leaf_nets"):
-        hints.append(f"该设计顶层时钟派生出 {len(facts['clock_leaf_nets'])} 个内部时钟网络")
-    if facts.get("clock_inverted"):
-        hints.append("存在经反相器派生的时钟（存在混沿）")
-    dff = facts.get("dff_types") or {}
-    if dff:
-        hints.append("DFF 单元：" + ", ".join(f"{k}×{v}" for k, v in list(dff.items())[:6]))
-        if not facts.get("sff_types"):
-            hints.append("网表里没有现成 SFF 单元 → 需要 scan_cell_mappings")
-    icg = facts.get("icg") or {}
-    if icg.get("cells") or icg.get("floating_clk") or icg.get("floating_clock_roots"):
-        hints.append("网表含时钟门控单元(ICG) → scan_enable 的 usage 必须是 all")
-    facts_block = "\n".join(f"- {h}" for h in hints) or "（未解析到）"
 
     user_prompt = f"""# 任务说明书
 {task['task_spec']}
@@ -444,19 +375,13 @@ def extract_task_understanding(task, llm, thinking=True):
 库: {json.dumps(rel_view['lib'], ensure_ascii=False)}
 CTL: {json.dumps(rel_view['ctl'], ensure_ascii=False)}
 
-# 网表事实（已由工具确定性解析，直接采信，不要重新推断）
-{facts_block}
+# 说明：本抽取**只依据任务说明书与输入文件清单**。
+# 不注入 golden.dofile —— 它是 public case 的参考答案，hidden case 不提供，
+# 注入会让抽取结果依赖不可得的材料（赛题 docx 8.2.1/8.2.2）。
 
 请抽取结构化配置。"""
 
-    # 输出上限：**按思考档位分别取值**。
-    #
-    # 3000 是为「关思考」调出来的 —— 不产出 reasoning，正文只有一段 JSON，
-    # 3000 绰绰有余，且能压低延迟。
-    # 但开思考时 reasoning token 也吃这个闸门：实测 3000 会在「想完了、还没开始
-    # 写 JSON」时被截断，正文 0 字符 → 整次理解白跑（2026-10-28 t1/case6 实测：
-    # `reasoning 占满 3000 tokens（正文为空），放弃本次调用`）。
-    # 所以开思考时放到 30000（与 llm_client._REASONING_RETRY_CAP 同口径）。
+    # 输出上限收紧到「纯 JSON 抽取」所需（默认 8000 会拉长延迟，见 config 注释）
     max_tokens = 3000
     try:
         try:
@@ -466,11 +391,5 @@ CTL: {json.dumps(rel_view['ctl'], ensure_ascii=False)}
         max_tokens = _cfg.LLM_UNDERSTAND_MAX_TOKENS
     except Exception:                                           # noqa: BLE001
         pass
-    if thinking:
-        max_tokens = max(int(max_tokens), 30000)
 
-    # 理解阶段默认**开思考**：这一步是把任务书自然语言读成「哪段是设计描述、
-    # 哪段是配置要求、单时钟域该怎么配」，属于推理活。调用方按预算窗口
-    # 传 thinking=False 时才降级为快档（仍是 LLM 调用，只是不输出 reasoning）。
-    return llm.chat_json(system_prompt, user_prompt, max_tokens=max_tokens,
-                         thinking=thinking)
+    return llm.chat_json(system_prompt, user_prompt, max_tokens=max_tokens)

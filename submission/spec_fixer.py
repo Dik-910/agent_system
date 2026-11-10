@@ -82,7 +82,6 @@ def collect_facts(task):
     input_dir = (task.get("input_dir") or "/input").replace("\\", "/").rstrip("/")
 
     facts = {
-        "task_spec": spec,          # 供 _fix_explicit_switches 等"按原文纠正"的规则使用
         "input_dir": input_dir,
         "netlist_path": None,
         "clock": [],
@@ -99,7 +98,6 @@ def collect_facts(task):
         "drc_ignore_rules": [],
         "wants_wrapper": False,
         "lib_cells": _lib_cells(input_dir),
-        "unloaded_ports": [],
     }
     if not spec:
         return facts
@@ -113,75 +111,11 @@ def collect_facts(task):
     _drc_from_spec(spec, facts)
     facts["netlist_path"] = _netlist_path(task, spec, input_dir)
     facts["wants_wrapper"] = bool(re.search(r"wrapper\s*(扫描|链|scan)", spec, re.I))
-    facts["unloaded_ports"] = _unloaded_ports(task, facts)
-    # 顶层端口集合：给 _closest_port 做「真实端口不改写」的护栏。
-    # 没有它，多时钟设计里 difflib/前缀匹配会把 clk_b 改成 clk_a ——
-    # 三个时钟域塌成一个（2026-11-01 变体 case 实测 DFTR1×528）。
-    # 顶层端口集合：优先用 netlist_facts 已算好的 top_ports（它会正确识别顶层 module），
-    # 退路才是读网表头部自己解析 —— 后者用「第一个 module」的启发式，遇到网表里
-    # 先出现 ICG 单元定义时会抓成 CLK/EN/ENCLK/TE（2026-11-02 回归实测）。
-    try:
-        _tp = set(((task or {}).get("_facts") or {}).get("top_ports") or {})
-        if not _tp:
-            _tp = set(_netlist_ports(_netlist_head(input_dir, facts["netlist_path"])))
-        facts["netlist_ports"] = {p.split("[")[0] for p in _tp}
-    except Exception:                                           # noqa: BLE001
-        facts["netlist_ports"] = set()
     return facts
-
-
-# 无负载端口事实只服务于「信号类型错配」这一判断，而它只出现在小的修复型 case 上。
-# 大网表读全文风险大于收益（task_2/case5 是 245MB），直接跳过。
-_UNLOADED_SIZE_CAP = 8 * 1024 * 1024
-
-
-def _unloaded_ports(task, facts):
-    """
-    顶层「声明了但没有任何负载」的端口清单。
-
-    用途：识别「被声明成时钟、其实一个负载都没有」的类型错配（DFTR8 + DFTR3）。
-    任何异常都退化为空清单 —— 这只是辅证，不该影响主修复链。
-
-    结果按 (网表路径, 顶层名) 缓存：本函数在一次 case 里会被调用 2~3 次
-    （fix_to_spec / ensure_scan_cfg / normalize），每次都读一遍网表纯属浪费。
-    """
-    paths = (task or {}).get("files", {}).get("netlist") or []
-    if not paths:
-        return []
-    _key = tuple(sorted(str(p) for p in paths))
-    if _key in _UNLOADED_CACHE:
-        return list(_UNLOADED_CACHE[_key])
-    try:
-        import netlist_facts as _nf
-        import lec_verifier as _lv
-        total = 0
-        for p in paths:
-            if os.path.exists(p):
-                total += os.path.getsize(p)
-        if not total or total > _UNLOADED_SIZE_CAP:
-            _UNLOADED_CACHE[_key] = []
-            return []
-        lib_meta = {c: {} for c in (facts.get("lib_cells") or [])}
-        with open(paths[0], "r", encoding="utf-8", errors="replace") as fh:
-            text = fh.read()
-        top = _lv._guess_top(text, lib_meta)
-        if not top:
-            return []
-        out = list(_nf._unloaded_ports(paths, top) or [])
-        _UNLOADED_CACHE[_key] = out
-        return list(out)
-    except Exception:                                            # noqa: BLE001
-        return []
-
-
-_UNLOADED_CACHE = {}
 
 
 def _signals_from_spec(spec, facts):
     """复用 dofile_generator 的纯 task_spec 信号抽取（不合并参考 dofile）。"""
-    # `_fix_scan_signals` 裁决 `-usage scan` 去留时要看题面措辞（哪条使能管什么），
-    # 但它的签名里只有 facts —— 在这里把原文带上，省得再穿一层参数。
-    facts["_spec_text"] = spec or ""
     u = {
         "scan_cell_mappings": [], "clock_signals": [], "scan_enable_signals": [],
         "reset_signals": [], "constant_signals": [], "icg_exclude_elements": [],
@@ -253,34 +187,19 @@ def _supplement_signals(spec, facts):
 
 
 def _spec_wants_se_on_icg(spec):
-    """
-    task_spec 是否要求 scan_enable 同时覆盖扫描 FF 与 ICG。
-
-    直接复用生成侧的同一条判据（dofile_generator.spec_covers_icg_and_scan），
-    两边必须一致 —— 否则生成路径给 `-usage scan`、修复路径给 `-usage all`，
-    同一个 case 走不同入口产出不同配置。
-
-    注意**不能**放宽成「同一行同时提到 SFF 与 ICG」：t2/c4 的题面就是
-    「`scan_cg_en_i` 控制 SFF 的 shift/capture 切换，并确保移位阶段所有 ICG
-    保持导通」，而 golden 只写 `-port scan_cg_en_i`（不写 usage）—— 那里的 ICG
-    已经由「功能使能与 scan_cg_en_i 的逻辑或」驱动，不需要这条使能再去覆盖。
-    真正要 all 的是「一条使能同时覆盖两类用途」的措辞（t2/c1 题干 + golden 均为 all）。
-    """
-    try:
-        return bool(_dg.spec_covers_icg_and_scan(spec))
-    except Exception:                                           # noqa: BLE001
-        return False
+    """task_spec 是否要求 scan_enable 同时覆盖扫描 FF 与 ICG。"""
+    for line in (spec or "").splitlines():
+        if not re.search(r"ICG|clock\s*gating|时钟门控|门控", line, re.I):
+            continue
+        if re.search(r"扫描\s*(FF|单元|触发器)|SFF|shift\s*/\s*capture|shift/capture", line, re.I):
+            return True
+    return False
 
 
 _CHAIN_COUNT_PATS = (
     r"共\s*\*{0,2}(\d+)\s*条(?:扫描)?链",
     r"(?:chain_count)\s*[:=]?\s*(\d+)",
     r"(?:扫描链数量|链条数|扫描链个数|链数)\s*(?:为|是|[:=])\s*(\d+)",
-    # 「切/分成 4 条扫描链」「4 条链」—— 没有「共」字的写法同样常见
-    r"(?:分为|划分(?:为|成)|切成|分成)\s*(\d+)\s*条",
-    r"(?<![\d/])(\d+)\s*条(?:内部|扫描|wrapper)?\s*扫描?链",
-    # 「chain_count=8 应改为 4」「链数修正为 4」
-    r"(?:chain_count|链数)[^\d\n]{0,8}?(\d+)",
 )
 
 _MAX_CHAIN_PATS = (
@@ -288,29 +207,6 @@ _MAX_CHAIN_PATS = (
     r"扫描链数\s*不(?:得)?超过\s*(\d+)",
     r"扫描链(?:数)?\s*(?:必须|需|应)?\s*(?:控制|限制)?在\s*(\d+)\s*(?:条|对)?以内",
 )
-
-# 「链数不得超过 5」是**上限**不是确切链数。把上限写成 -chain_count 会让工具按
-# 5 条去切，与「359 个 FF / max_length 50 → 至少 8 条」之类的真实约束打架。
-# 命中模式后再看上下文，落在“上限”语境里的一律不当成确切链数。
-_CHAIN_BOUND_RE = re.compile(
-    r"不得|不超过|不超过|以内|上限|最多|至多|控制在|限制在|不大于")
-
-
-def _exact_chain_count(spec):
-    """从 task_spec 取「确切链数」；只有上限语境时返回 None。"""
-    for pat in _CHAIN_COUNT_PATS:
-        for m in re.finditer(pat, spec or ""):
-            try:
-                n = int(m.group(1))
-            except (TypeError, ValueError):
-                continue
-            if n <= 0:
-                continue
-            ctx = (spec or "")[max(0, m.start() - 16): m.end() + 6]
-            if _CHAIN_BOUND_RE.search(ctx):
-                continue
-            return n
-    return None
 
 
 def _scan_cfg_from_spec(spec, facts):
@@ -324,30 +220,14 @@ def _scan_cfg_from_spec(spec, facts):
         pass
     cfg = dict(u.get("scan_cfg") or {})
 
-    # 分区表（| 分区 | chain_count |）是**逐分区**链数，不能折成一个全局链数：
-    # 表格里每一行都可能出现数字，抽成全局会写出 `set_scan_cfg -chain_count 34`
-    # 这种与任务书冲突的配置。
-    _has_part_table = bool(
-        re.search(r"\|\s*分区\s*\|[^\n]*chain_count", spec, re.I))
-
-    if not _has_part_table:
-        n = _exact_chain_count(spec)
-        if n:
-            cfg["chain_count"] = n
-
-    # 「4 条链，长度 64/44/44/64」：逐链长度同时给出链数与 max_length。
-    # 只靠「共 N 条链」的写法抓不到这种 —— 而 max_length 写小了必然多切链，
-    # 写大了又会把几条并成一条，两种都直接违反任务书。
-    _lm = re.search(
-        r"(?:长度|链长|每条)[^\n\d]{0,10}?((?:\d{1,6}\s*[/、,]\s*){1,7}\d{1,6})", spec)
-    if _lm:
-        _lens = [int(x) for x in re.findall(r"\d+", _lm.group(1))]
-        # 有分区表时这条也属于「逐分区」量（case2 的「所有非默认分区的扫描链
-        # 最大长度统一为 300」会被这里当成全局 300），交给分区配置去写。
-        if _lens and not _has_part_table:
-            cfg.setdefault("max_length", max(_lens))
-            if len(_lens) >= 2:
-                cfg.setdefault("chain_count", len(_lens))
+    for pat in _CHAIN_COUNT_PATS:
+        for m in re.finditer(pat, spec):
+            n = int(m.group(1))
+            if n > 0:
+                cfg["chain_count"] = n
+                break
+        if cfg.get("chain_count"):
+            break
 
     for pat in _MAX_CHAIN_PATS:
         m = re.search(pat, spec)
@@ -355,16 +235,10 @@ def _scan_cfg_from_spec(spec, facts):
             facts["max_chain_count"] = int(m.group(1))
             break
 
-    # 「链最大长度不超过 100」这类上限 -> max_length。
-    #
-    # 有分区表时**不写全局**：case2 的「所有非默认分区的扫描链最大长度统一为 300」
-    # 是逐分区的量。写进全局会让默认分区也被 300 卡住，与 golden（只在
-    # set_current_scan_partition 之后的 set_scan_cfg 里写）不一致 —— 实测表现为
-    # 全局多出 `-max_length 300`，而分区一个都没有。
-    if not _has_part_table:
-        for m in re.finditer(
-                r"(?:最大\s*链?\s*长(?:度)?|链\s*最大\s*长(?:度)?)[^\d\n]{0,40}?(\d{1,6})", spec):
-            cfg.setdefault("max_length", int(m.group(1)))
+    # 「链最大长度不超过 100」这类上限 -> max_length
+    for m in re.finditer(
+            r"(?:最大\s*链?\s*长(?:度)?|链\s*最大\s*长(?:度)?)[^\d\n]{0,40}?(\d{1,6})", spec):
+        cfg.setdefault("max_length", int(m.group(1)))
 
     # 扫描数据端口命名格式：task_spec 写作 `scan_si_%d` / `scan_so_%d`
     # （case3）或 `scan_data_in_%d` / `scan_data_out_%d`（case4/5）。
@@ -508,612 +382,6 @@ def _exclusions_from_spec(spec, facts):
             facts["associated_internal_clocks"].append(ref)
 
 
-_CLK_NAME_RE = re.compile(r"(?:^|_)(?:clk|clock)(?:_|$)|clk$|clock$", re.I)
-_RST_NAME_RE = re.compile(r"(?:^|_)(?:rst|reset|resetn)(?:_|$)|rst[ln]?$|resetn?$", re.I)
-
-# 题面明确「不要」的口径：功能时钟 / 不参与 / 不纳入 / 排除 / 禁止 …
-_SPEC_EXCLUDE_NEAR_RE = re.compile(
-    r"功能时钟|不参与|不纳入|排除|禁止|不作为|不声明|非扫描|不当作|不视为|"
-    r"无需配置|无需声明|无需设置|不需要配置|不需要声明|不必配置|不必声明")
-
-
-def _spec_mentions(spec, port):
-    """端口名在题面里出现过（按词边界，避免 clk 命中 clk_i）。"""
-    return re.search(r"(?<![\w])%s(?![\w])" % re.escape(port), spec or "") is not None
-
-
-def _spec_excludes(spec, port):
-    """端口在题面出现的位置附近，有没有「功能时钟 / 不纳入 / 排除」这类否定口径。"""
-    text = spec or ""
-    for m in re.finditer(r"(?<![\w])%s(?![\w])" % re.escape(port), text):
-        seg = text[max(0, m.start() - 60):m.end() + 60]
-        if _SPEC_EXCLUDE_NEAR_RE.search(seg):
-            return True
-    return False
-
-
-def ensure_signal_declarations(task, dofile_text, facts=None):
-    """
-    用「网表事实 + 题面依据」补漏声明的时钟/复位。
-
-    为什么需要（2026-11-02 v21 评测报告，10 个 case 只过 1 个）：
-    信号声明有两条路径 —— `_rule_signals_from_spec`（只认表格和「X 为扫描时钟」祈使句）
-    与 LLM understanding（受预算/稳定性影响）。**两条都不看网表**。题面换成
-    纯叙述写法（官方 t2/c3 就是：「顶层时钟 clk 通过 36 个时钟门控单元分发…」，
-    实测规则抽取 clock=[] 一个都抽不到），一旦 LLM 也不稳，就整段声明缺失 → 0 条链、
-    DFTR1/DFTR3 成片。
-
-    补齐必须同时满足三个条件，缺一不可：
-      ① 端口在**网表顶层端口**里真实存在（不是 ICG 输出引脚、不是编造的名字）；
-      ② 端口名在 **task_spec 里出现过**（题面确实提到它，不是凭空枚举）；
-      ③ 端口附近**没有**「功能时钟 / 不纳入 / 排除」这类否定口径
-         （t2/c6 的 `clk_a` 被题面称为「功能时钟端口」且禁当扫描时钟，
-           GCLK 是 ICG 输出引脚 —— 这两个都必须排除）。
-    另外前置处理型（三步）跳过：那种形态根本不声明扫描时钟。
-    """
-    if not dofile_text:
-        return dofile_text
-    try:
-        if list(_dg.decide_workflow(task or {}, None) or []) != ["full_scan"]:
-            return dofile_text
-    except Exception:                                           # noqa: BLE001
-        return dofile_text
-    spec = (task or {}).get("task_spec", "") or ""
-    if not spec:
-        return dofile_text
-    try:
-        facts = facts or collect_facts(task)
-    except Exception:                                           # noqa: BLE001
-        return dofile_text
-    ports = facts.get("netlist_ports") or set()
-    if not ports:
-        return dofile_text
-
-    # ── 类型纠错：声明成 clock、但网表里根本不驱动任何时序单元 CLK 的复位端口 ──
-    # 2026-11-02 v21 报告 t2_02：`set_scan_signal -type clock -port resetn
-    # -off_state 1`，复位被当扫描时钟，246 条 DRC 全由这一行产生。
-    # 判据用网表事实 clock_ports（每个顶层端口实际驱动的时序单元数），
-    # 不看名字猜 —— 名字只用来确认"它确实是个复位"。
-    _nf = (task or {}).get("_facts") or {}
-    _clock_ports = _nf.get("clock_ports") or {}
-    if _clock_ports:
-        decl_clk_now = re.findall(
-            r"set_scan_signal\s+-type\s+clock\s+-port\s+(\S+)", dofile_text)
-        for _p in set(decl_clk_now):
-            if _p in _clock_ports or not _RST_NAME_RE.search(_p):
-                continue
-            if _spec_excludes(spec, _p):
-                # 题面明说它无需配置（t2/c1 原文：「resetn 为低有效异步复位输入，
-                # 但可扫描寄存器均为无复位的 dfxtp_1 … 无需配置 reset 扫描信号」）
-                # -> 这行本身就是多余配置，直接删掉，既不改 clock 也不改 reset。
-                dofile_text = re.sub(
-                    r"^[ \t]*set_scan_signal\s+-type\s+clock\s+-port\s+%s\b[^\n]*\n?"
-                    % re.escape(_p), "", dofile_text, flags=re.M)
-                print("  ↻ %s 声明为 clock，但它在网表里不驱动 CLK、题面也注明无需配置"
-                      "→ 删除该行" % _p)
-            else:
-                _off = 1 if _dg._port_implies_active_low(_p) else 0
-                dofile_text = re.sub(
-                    r"(set_scan_signal\s+-type\s+)clock(\s+-port\s+%s\b)[^\n]*"
-                    % re.escape(_p),
-                    r"\1reset\2 -off_state %d" % _off, dofile_text)
-                print("  ↻ %s 声明为 clock，但网表里不驱动任何 CLK（clock_ports 无此项）"
-                      "→ 改为 reset -off_state %d" % (_p, _off))
-
-    decl_clk = set(re.findall(
-        r"set_scan_signal\s+-type\s+clock\s+-port\s+(\S+)", dofile_text))
-    decl_rst = set(re.findall(
-        r"set_scan_signal\s+-type\s+reset\s+-port\s+(\S+)", dofile_text))
-
-    def _pick(regex, declared, other_kind):
-        out = []
-        for p in sorted(ports):
-            if p in declared or not regex.search(p):
-                continue
-            # 同一端口不能既是 clock 又是 reset：original 的注入故障常把复位写成
-            # clock（t2/c1 的 `-type clock -port resetn`），补 reset 时要跳过它，
-            # 否则会出现"既当扫描时钟又当复位"的两条冲突声明。
-            if p in other_kind:
-                continue
-            # 只认纯顶层端口名：网表事实里可能混进层次路径
-            # （t1/c5 的 9 个 `x_aq_.../clk_out` 门控时钟输出点），补进去必然 SCAN-1620。
-            if "/" in p or "." in p or "[" in p:
-                continue
-            if not _spec_mentions(spec, p) or _spec_excludes(spec, p):
-                continue
-            out.append(p)
-        return out
-
-    # **只在该类声明完全为空时才补**。理由：已有部分声明时，缺的那个可能是
-    # 故意不声明的（功能时钟 / 另一时钟域由分区单独声明），补错会污染正确配置；
-    # 而"一条都没有"必然导致 DFTR1/DFTR3 成片、0 条链，属于必须救的致命场景。
-    add_clk = _pick(_CLK_NAME_RE, decl_clk, decl_rst) if not decl_clk else []
-    add_rst = _pick(_RST_NAME_RE, decl_rst, decl_clk) if not decl_rst else []
-    # 多候选时不敢补：同类型有 2 个以上候选，说明题面提到的端口不止一个，
-    # 谁是扫描时钟、谁该排除往往写在别处（t2/c2 同时有 wb_clk / wb_clk_i，
-    # 参考解只用 wb_clk_i），逐个猜会改坏时钟域划分。
-    if len(add_clk) > 1:
-        add_clk = []
-    if len(add_rst) > 1:
-        add_rst = []
-    if not add_clk and not add_rst:
-        return dofile_text
-
-    lines = ["set_scan_signal -type clock -port %s" % p for p in add_clk]
-    lines += ["set_scan_signal -type reset -port %s -off_state %d"
-              % (p, 1 if _dg._port_implies_active_low(p) else 0) for p in add_rst]
-    if add_clk or add_rst:
-        print("  ↻ 按网表事实补声明：时钟 %s / 复位 %s"
-              % (add_clk or "无", add_rst or "无"))
-    out = _insert_after_anchor(dofile_text, lines,
-                               r"^[ \t]*present_design\b.*$")
-    return out
-
-
-# 题面里的「分区（时钟，N 链，≤长度）」写法
-_PART_CLK_PAT = re.compile(r"`([A-Za-z_]\w*)`\s*[（(]\s*`([A-Za-z_]\w*)`\s*[,，]")
-
-
-def ensure_partition_clocks(task, dofile_text, facts=None):
-    """
-    分区用 `-clocks` 形态时，把 `-clocks` 的值与题面写的对应关系对齐。
-
-    2026-11-02 v5 实测 `t2_04_ac97_partition`：题面第 32 行写
-    「`p_sys`（`clk_i`，4 链，≤600）、`p_audio`（`bit_clk_pad_i`，2 链，≤300）」，
-    第 46 行还写「不允许把两个时钟域放进同一分区」。而 original 里**两个分区
-    都写成 `-clocks {clk_i}`** —— `p_audio` 与 `p_sys` 抢同一批 FF，
-    `bit_clk_pad_i` 域整个落进 Default_Partition。
-
-    判据（三条全满足才动，缺一不可）：
-      ① 题面确实提到 `-clocks`（说明是 clocks 形态，不是 `-include` 列实例）；
-      ② 题面出现「`分区名`（`时钟名`，…」这种紧邻写法；
-      ③ 目标时钟**已经声明为 clock**（补完声明之后才可信）。
-    公开 12 个 case 实测：只有 t2/c2 提到 -clocks，但它题面没有这种"（时钟，"写法
-    → 零触发；t1/c2 用的是 `-include`，更不触发。
-    """
-    if not dofile_text:
-        return dofile_text
-    spec = (task or {}).get("task_spec", "") or ""
-    if not spec or not re.search(r"-clocks", spec):
-        return dofile_text
-    pairs = [(p, c) for p, c in _PART_CLK_PAT.findall(spec) if p and c]
-    if not pairs:
-        return dofile_text
-    declared = set(re.findall(
-        r"set_scan_signal\s+-type\s+clock\s+-port\s+(\S+)", dofile_text))
-    fixed = []
-    for part, clk in pairs:
-        if clk not in declared:
-            continue
-        pat = re.compile(r"(add_scan_partition\s+%s\s+-clocks\s+\{)([^}]*)(\})"
-                         % re.escape(part))
-        m = pat.search(dofile_text)
-        if not m:
-            continue
-        cur = m.group(2).split()
-        if cur == [clk]:
-            continue
-        dofile_text = pat.sub(lambda mm: mm.group(1) + clk + mm.group(3),
-                              dofile_text, count=1)
-        fixed.append("%s: {%s} -> {%s}" % (part, " ".join(cur), clk))
-    if fixed:
-        print("  ↻ 分区 -clocks 与题面不一致，已按题面改正：" + "；".join(fixed))
-    return dofile_text
-
-
-# 题面里的「`分区`（`时钟`，N 链，≤M）」写法（比 _PART_CLK_PAT 多抓链数/链长）
-_PART_BUDGET_PAT = re.compile(
-    r"`([A-Za-z_]\w*)`\s*[（(]\s*`([A-Za-z_]\w*)`\s*[,，]\s*"
-    r"(\d+)\s*链\s*[,，]\s*(?:≤|<=|<)?\s*(\d+)")
-
-
-def ensure_partition_chain_count(task, dofile_text):
-    """
-    分区级 `set_scan_cfg -chain_count / -max_length` 按题面预算校正。
-
-    2026-11-02 v5 实测 `t2_04_ac97_partition`：题面第 32 行写
-    「`p_sys`（`clk_i`，4 链，≤600）、`p_audio`（`bit_clk_pad_i`，2 链，≤300）」，
-    original 却把 p_sys 写成 `-chain_count 8`。链数与题面不符虽不报 ERROR，
-    但 `scan_chain.rpt` 里 p_sys 建了 8 条 234 位的链，验收表直接对不上。
-
-    定位方式：`set_current_scan_partition <分区>` 之后的第一条 `set_scan_cfg`
-    就是该分区的配置，只改这一条里的这两个选项。
-
-    判据：题面必须同时给出「分区名 + 时钟名 + N 链 + 长度」四要素的紧邻写法。
-    公开 12 个 case 的题面分区信息都是表格（分区名 | 归属区域 | 说明）或
-    `-include` 形态，没有这种「（时钟，N 链，≤M）」表达式 → 零触发。
-    """
-    if not dofile_text:
-        return dofile_text
-    spec = (task or {}).get("task_spec", "") or ""
-    if not spec:
-        return dofile_text
-    rows = _PART_BUDGET_PAT.findall(spec)
-    if not rows:
-        return dofile_text
-
-    lines = dofile_text.splitlines(keepends=True)
-    changed = []
-    for part, _clk, cnt, length in rows:
-        # 找到 `set_current_scan_partition <分区>` 之后的第一条 set_scan_cfg
-        start = None
-        for i, l in enumerate(lines):
-            if re.match(r"set_current_scan_partition\s+%s$" % re.escape(part),
-                        l.strip()):
-                start = i
-                break
-        if start is None:
-            continue
-        idx = None
-        for j in range(start + 1, len(lines)):
-            if re.match(r"\s*set_current_scan_partition\b", lines[j]):
-                break
-            if re.match(r"\s*set_scan_cfg\b", lines[j]):
-                idx = j
-                break
-        if idx is None:
-            continue
-        old = lines[idx]
-        new = re.sub(r"-chain_count\s+\d+", "-chain_count " + cnt, old)
-        new = re.sub(r"-max_length\s+\d+", "-max_length " + length, new)
-        if new != old:
-            lines[idx] = new
-            changed.append("%s: chain_count/max_length -> %s/%s"
-                           % (part, cnt, length))
-    if changed:
-        print("  ↻ 分区链路预算与题面不一致，已改正：" + "；".join(changed))
-    return "".join(lines)
-
-
-# 题面里的「时钟域表」行：| `port` | 描述（含时钟域/时钟）| 实例列表 |
-_CLK_DOMAIN_ROW = re.compile(
-    r"^\|\s*`([A-Za-z_]\w*)`\s*\|\s*([^|\n]*)\|\s*([^|\n]*)\|", re.M)
-
-
-def ensure_clock_domain_decls(task, dofile_text, facts=None):
-    """
-    题面用**表格**列出多个时钟域时，把漏声明的那几个补上。
-
-    为什么单独做（2026-11-02 v5 实测 `t2_04_ac97_partition`）：
-    题面第 23 行是明确的三列表 —— `| bit_clk_pad_i | AC-Link 位时钟域 | u0 / u1 / u2 |`，
-    第 32 行又写「`p_audio`（`bit_clk_pad_i`，2 链，≤300）」。但 original 只声明了
-    `clk_i`，`bit_clk_pad_i` 这个独立异步时钟一个声明都没有 → 它驱动的 FF 没有时钟域
-    归属，`pre_drc.rpt` 报 353 条 DFTR1，`p_audio` 分区匹配不到单元、只剩 4 条链。
-
-    `ensure_signal_declarations` 只在「该类声明**完全为空**」时才补，救不了
-    「已声明一个、漏了另一个」；本函数专门补这个缺口，但判据比它更硬：
-      ① 端口出现在题面的**时钟域表格**里，且该行描述含「时钟 / 时钟域 / clock」；
-      ② 端口在网表**顶层端口**里真实存在（不是 ICG 输出、不是编造）；
-      ③ 该端口尚未声明为 clock；
-      ④ 端口附近没有题面的否定口径（功能时钟 / 不纳入 / 无需配置 …）。
-    公开 12 个 case 实测**零触发**（该声明的一个不缺），只有 t2_04 命中
-    `bit_clk_pad_i`。
-    """
-    if not dofile_text:
-        return dofile_text
-    spec = (task or {}).get("task_spec", "") or ""
-    if not spec:
-        return dofile_text
-    try:
-        facts = facts or collect_facts(task)
-    except Exception:                                           # noqa: BLE001
-        return dofile_text
-    ports = facts.get("netlist_ports") or set()
-    if not ports:
-        return dofile_text
-
-    declared = set(re.findall(
-        r"set_scan_signal\s+-type\s+clock\s+-port\s+(\S+)", dofile_text))
-    decl_rst = set(re.findall(
-        r"set_scan_signal\s+-type\s+reset\s+-port\s+(\S+)", dofile_text))
-
-    add, seen = [], set()
-    for m in _CLK_DOMAIN_ROW.finditer(spec):
-        port, desc = m.group(1), m.group(2)
-        if port in seen or port in declared or port in decl_rst:
-            continue
-        if not re.search(r"时钟域|时钟|clock", desc, re.I):
-            continue
-        if port not in ports:                 # 网表顶层端口里没有 -> 不补
-            continue
-        if _spec_excludes(spec, port):        # 题面否定了它 -> 不补
-            continue
-        seen.add(port)
-        add.append(port)
-    if not add:
-        return dofile_text
-
-    lines = ["set_scan_signal -type clock -port %s -off_state %d"
-             % (p, 1 if _dg._port_implies_active_low(p) else 0) for p in add]
-    print("  ↻ 题面时钟域表里还有 %d 个域未声明，补：%s" % (len(add), "、".join(add)))
-    return _insert_after_anchor(dofile_text, lines,
-                                r"^[ \t]*present_design\b.*$")
-
-
-def ensure_present_design(task, dofile_text, facts=None):
-    """
-    `present_design <X>` 指的模块名不是网表顶层时，改成真正的顶层。
-
-    2026-11-02 v5 实测 `t2_05_desperf_sff_eco`：网表文件叫 `des_perf.v`，
-    但顶层模块是 `des3`。original 写了 `present_design des_perf`，工具报
-    `[COM-3008] Nothing matched for 'design'`，`present_design` 根本没生效
-    （退回"网表里最后一个 module"兜底），后面所有配置都作用在错误的顶层上。
-
-    判据只依赖网表事实：`netlist_facts` 的 `top` 字段已经能正确识别顶层
-    （t2_05 实测给出 `des3`）。且公开 12 个 case 的 `present_design`
-    **全部等于** 该字段，所以这条规则对它们零触发。
-    """
-    if not dofile_text:
-        return dofile_text
-    try:
-        facts = facts or collect_facts(task)
-    except Exception:                                           # noqa: BLE001
-        return dofile_text
-    top = str((facts or {}).get("top") or "").strip()
-    if not top:
-        return dofile_text
-    hits = re.findall(r"^[ \t]*present_design[ \t]+(\S+)", dofile_text, re.M)
-    if not hits or all(h == top for h in hits):
-        return dofile_text
-    for bad in {h for h in hits if h != top}:
-        dofile_text = re.sub(
-            r"^([ \t]*)present_design[ \t]+%s\b" % re.escape(bad),
-            r"\1present_design " + top, dofile_text, flags=re.M)
-        print("  ↻ present_design %s → %s（网表顶层模块名，%s 不存在）"
-              % (bad, top, bad))
-    return dofile_text
-
-
-def force_replace_true(task, dofile_text, understanding=None):
-    """
-    完整插链场景下 `set_scan_cfg -replace false` 必须改成 true。
-
-    2026-11-02 v21 评测报告：某 case 的 `-replace false` 把 DFF→SFF 替换整个关掉，
-    链数 202 看着对，实际只上链 5264/8808 个 FF；另一个 case 直接 0 条链。
-    官方 12 个 golden 里 `-replace` 只出现过一次（task_1/case2 的 `true`），
-    **从不写 false** —— 完整插链却不替换，等于没插链。
-
-    前置处理型（三步）不走这条：那里由 `-replace_only` 单独控制。
-    """
-    if not dofile_text:
-        return dofile_text
-    try:
-        steps = _dg.decide_workflow(task or {}, understanding)
-    except Exception:                                           # noqa: BLE001
-        steps = ["full_scan"]
-    if list(steps or ["full_scan"]) != ["full_scan"]:
-        return dofile_text
-    new, n = re.subn(r"(-replace\s+)false\b", r"\1true", dofile_text)
-    if n:
-        print("  ↻ -replace false → true（完整插链必须做 DFF→SFF 替换，否则链为空）")
-    return new
-
-
-_PRE_STEP_DUMP = {
-    "connect_icg_only": 'dump_netlist -file "$out_res_dir/post_connect_icg.v"',
-    "replace_only": 'dump_netlist -file "$out_res_dir/post_replace_sff.v"',
-    "replace_unscan": 'dump_netlist -file "$out_res_dir/post_replace_unscan.v"',
-}
-
-
-def ensure_workflow_steps(task, dofile_text, understanding=None):
-    """
-    前置处理型（三步）的 `insert_dft_logic -xxx_only` 缺步补齐。
-
-    2026-11-02 v21 评测报告：某诊断修复型 case 的 original 把
-    `insert_dft_logic -replace_only` 整行删掉了（只留注释），agent 没补回来，
-    回放计数 `post_connect_icg 76 → post_replace_sff 76 → post_replace_unscan 0`，
-    替换根本没发生 —— 整 case 零分。
-
-    官方 12 个 case 里有 2 个就是这种三步形态（task_1/case1、case4，都是
-    `-connect_icg_only` / `-replace_only` / `-replace_unscan` + 各自 dump_netlist），
-    所以这属于**必考能力**，而生成侧一直是对的（`generate_from_config` 按 workflow
-    逐条写），漏的只有修复侧。
-
-    保守前提：只在该 dofile **已经有至少一条** `-xxx_only` 时才补 ——
-    一条都没有说明它可能是完整插链型（题面误判），此时不动。
-    """
-    if not dofile_text:
-        return dofile_text
-    try:
-        steps = _dg.decide_workflow(task or {}, understanding)
-    except Exception:                                           # noqa: BLE001
-        return dofile_text
-    if list(steps or []) != ["connect_icg_only", "replace_only", "replace_unscan"]:
-        return dofile_text
-
-    present = [s for s in _PRE_STEP_DUMP
-               if re.search(r"insert_dft_logic\s+-%s\b" % s, dofile_text)]
-    if not present:
-        return dofile_text
-    missing = [s for s in _PRE_STEP_DUMP if s not in present]
-    if not missing:
-        return dofile_text
-
-    lines = dofile_text.splitlines(keepends=True)
-    order = ["connect_icg_only", "replace_only", "replace_unscan"]
-    for step in missing:
-        block = ["insert_dft_logic -%s%s" % (step, _dg._verbose_flag()),
-                 _PRE_STEP_DUMP[step]]
-        later = next((x for x in order[order.index(step) + 1:] if x in present), None)
-        if later:
-            ai = next(i for i, l in enumerate(lines)
-                      if re.search(r"insert_dft_logic\s+-%s\b" % later, l))
-            lines[ai:ai] = [b + "\n" for b in block]
-        else:
-            ai = max(i for i, l in enumerate(lines)
-                     if re.match(r"\s*insert_dft_logic\b", l))
-            j = ai + 1
-            while j < len(lines) and re.match(r"\s*dump_netlist\b", lines[j]):
-                j += 1
-            lines[j:j] = [b + "\n" for b in block]
-        present.append(step)
-        print("  ↻ 补回前置处理步骤 insert_dft_logic -%s（+ 对应 dump_netlist）" % step)
-    return "".join(lines)
-
-
-_CLOCK_DECL_RE = re.compile(
-    r"^([ \t]*)set_scan_signal[ \t]+-type[ \t]+clock[ \t]+-port[ \t]+(\S+)(.*)$",
-    re.M)
-
-
-def restore_duplicated_clock_ports(task, dofile_text, facts=None):
-    """
-    还原「多条时钟声明被写成同一个端口」的注入故障。
-
-    2026-11-02 变体 case 报告 P1-1：三时钟域 case 的 original 里三条
-    `set_scan_signal -type clock` 全指向同一个时钟名，agent 一个都没改回来，
-    两个时钟域丢失 → DRC 残留 1700+ 条。
-
-    确定性做法：同一 clock 端口出现第 2 次起，按**出现顺序**依次换成 task_spec
-    声明过、但尚未被用到的时钟；不够换时把多余的重复行删掉（同一端口重复声明
-    本身也会触发 SCAN-4626）。
-
-    只在「确实有重复 clock 端口」时动手 —— 公开 12 个 case 的 clock 声明都唯一，
-    这条规则对它们完全不触发。
-    """
-    if not dofile_text:
-        return dofile_text
-    try:
-        facts = facts or collect_facts(task)
-    except Exception:                                           # noqa: BLE001
-        return dofile_text
-    spec_clks = [str(c.get("port") or "")
-                 for c in (facts.get("clock") or []) if c.get("port")]
-    spec_clks = list(dict.fromkeys(spec_clks))
-    if len(spec_clks) < 2:
-        return dofile_text          # 单时钟设计，重复就是纯粹的重复声明
-
-    seen, dup_found = set(), False
-    for m in _CLOCK_DECL_RE.finditer(dofile_text):
-        port = m.group(2)
-        if port in seen:
-            dup_found = True
-            break
-        seen.add(port)
-    if not dup_found:
-        return dofile_text
-
-    unused = [c for c in spec_clks if c not in seen]
-    state = {"seen": set(), "unused": unused, "fixed": [], "dropped": []}
-
-    def repl(m):
-        indent, port, tail = m.group(1), m.group(2), m.group(3)
-        if port not in state["seen"]:
-            state["seen"].add(port)
-            return m.group(0)
-        if state["unused"]:
-            new_port = state["unused"].pop(0)
-            state["seen"].add(new_port)
-            state["fixed"].append((port, new_port))
-            return "%sset_scan_signal -type clock -port %s%s" % (indent, new_port, tail)
-        state["dropped"].append(port)
-        return ""                   # 没有可换的时钟：删掉多余的重复声明
-
-    out = _CLOCK_DECL_RE.sub(repl, dofile_text)
-    if state["fixed"]:
-        print("  ↻ 还原被复制的时钟声明：" +
-              "、".join("%s→%s" % p for p in state["fixed"]))
-    if state["dropped"]:
-        print("  ↻ 删除多余的重复时钟声明：" + "、".join(state["dropped"]))
-    return out
-
-
-def ensure_cell_mappings(task, dofile_text, facts=None):
-    """
-    确保 task_spec 明确列出的 DFF→SFF 映射对**全部**出现在 dofile 里。
-
-    2026-11-02 变体 case 报告 P1-2：前置处理型 case 题面要求 4 类映射，
-    最终 0 条落网，流程还判"成功" —— 覆盖类验收直接失分。而抽取逻辑本身是对的
-    （公开 t1/c1 的题面能正确抽出 4 条，与 golden 一致），所以问题在"抽到了没写进去"。
-    这里做**交付前补齐**，只补题面列出的对，绝不凭网表多枚举 —— 官方口径是
-    「任务书没说明的配置不配是允许的」，多加反而偏离参考实现。
-    """
-    if not dofile_text:
-        return dofile_text
-    spec = (task or {}).get("task_spec", "") or ""
-    # 只在题面**明确要求指定映射**时才补。反例：task_1/case2 的题面列了
-    # 「单元类型 / 扫描单元」清单表，但任务要求里一个字都没提映射，golden 是
-    # **0 条**（全靠工具默认映射）—— 按清单表硬补 4 条就偏离参考实现了。
-    # 官方口径：「任务书没说明的配置不配是允许的」。
-    if not re.search(r"DFF\s*(?:→|->|到)\s*SFF", spec) \
-            and not re.search(r"(?:指定|按照|配置|声明)[^\n]{0,24}替换配对", spec):
-        return dofile_text
-    pairs = _dg._cell_mappings_from_spec(spec)
-    if not pairs:
-        return dofile_text
-    # 归一化到 Liberty 库里的**全名**，并丢掉库里查不到的映射对。
-    #
-    # 2026-11-02 v5 实测 t1_04：题面写的是短名 `dfxtp_1`，我们原样写进 dofile，
-    # 工具报 `[ERROR][COM-3008] Nothing matched for dfxtp_1` +
-    # `[ERROR][CMD-0074] set_scan_cell_mapping execution failed` —— 直接把
-    # "无 ERROR" 这条验收打掉。官方 12 份 golden 的映射全是全名
-    # （`sky130_fd_sc_hd__dfxtp_1`），生成路径本来就过这个函数，补齐路径之前漏了。
-    try:
-        pairs = _dg._canonical_cell_mappings(pairs, _dg.lib_cell_names(task))
-    except Exception:                                           # noqa: BLE001
-        pass
-    if not pairs:
-        return dofile_text
-    # 用**单元基名**比较：同一对映射常有两种写法 —— 表格里的全名
-    # `sky130_fd_sc_hd__dfxtp_1`、正文里的短名 `dfxtp_1`，`_cell_mappings_from_spec`
-    # 会各抽一条。按全名比较就会把"短名那条"当成缺失而重复补一行
-    # （t2/c6 实测：golden 1 条被补成 2 条）。
-    def _base(cell):
-        try:
-            return _dg._split_cell_name(cell)[1]
-        except Exception:                                       # noqa: BLE001
-            return cell
-
-    have = set()
-    for m in re.finditer(r"^[ \t]*set_scan_cell_mapping\s+(\S+)\s+(\S+)",
-                         dofile_text, re.M):
-        have.add((_base(m.group(1)), _base(m.group(2))))
-    missing, _seen_pairs = [], set()
-    for d, f in pairs:
-        key = (_base(d), _base(f))
-        if key in have or key in _seen_pairs:
-            continue
-        _seen_pairs.add(key)
-        missing.append((d, f))
-    if not missing:
-        return dofile_text
-    lines = ["set_scan_cell_mapping %s %s" % (d, f) for d, f in missing]
-    print("  ↻ 补 %d 条 DFF→SFF 映射（task_spec 要求但产物缺失）" % len(missing))
-    return _insert_after_anchor(
-        dofile_text, lines, r"^[ \t]*present_design\b.*$")
-
-
-def ensure_drc_cfg(task, dofile_text, facts=None):
-    """
-    按 task_spec 补 `set_scan_drc_cfg -clock_gating_init_cycles <N>`。
-
-    为什么单独加：`facts["icg_init_cycles"]` 早就从题面抽出来了（「级联深度 N 层」
-    → N-1；只提到级联则取 2），但**只有 task2 的修复路径 `_fix_drc` 用它**。
-    task1 是生成路径，从来不写这条命令 —— 题面明说「多级级联、每周期只传播一级」
-    的生成型 case 就会漏配，导致使能在仿真周期内传不到下级 ICG，DFTR9 成片
-    （2026-11-02 变体 case 报告 P1-3）。
-
-    只在**题面有明确依据**时才补（`icg_init_cycles` 非空），与官方口径一致：
-    「任务书没说明的配置不配是允许的」，不能因为设计里有 ICG 就无脑加。
-    """
-    if not dofile_text:
-        return dofile_text
-    try:
-        facts = facts or collect_facts(task)
-    except Exception:                                           # noqa: BLE001
-        return dofile_text
-    cycles = facts.get("icg_init_cycles")
-    if not isinstance(cycles, int) or cycles <= 0:
-        return dofile_text
-    if re.search(r"^[ \t]*set_scan_drc_cfg\b", dofile_text, re.M):
-        return dofile_text          # 已有：数值校准交给 _fix_drc，不重复插
-    return _insert_after_anchor(
-        dofile_text,
-        ["set_scan_drc_cfg -clock_gating_init_cycles %d" % cycles],
-        r"^[ \t]*examine_scan_drc\b.*$")
-
-
 def _norm_rule_id(rid):
     """
     DRC 规则号规范化。
@@ -1156,33 +424,11 @@ def _reset_from_spec(spec, facts):
         if re.search(r"无需配置|不需要配置|不必配置|不配置|无需\s*set_scan_signal|不作为\s*set_scan_signal", line):
             return
     port = None
-    off_hint = None
     for m in re.finditer(
             r"复位(?:信号)?\s*`([A-Za-z_]\w*)`|`([A-Za-z_]\w*)`\s*(?:端口)?(?:配置为|作为|设为)复位", spec):
         port = m.group(1) or m.group(2)
         if port:
             break
-    if not port:
-        # 兜底：逐句扫「复位 + 极性」同现的句子，端口名不要求反引号。
-        # 任务书的写法五花八门 ——
-        #   「`rst_n`：低电平有效的异步复位输入。」（冒号式）
-        #   「rst_n 为低有效复位输入，测试模式…」（无反引号）
-        # 这两种旧正则都抓不到，结果复位根本不声明 -> 全部 FF 复位不可控（DFTR3）。
-        for sent in re.split(r"[。；;\n]", spec or ""):
-            if not re.search(r"复位|reset|rst", sent, re.I):
-                continue
-            if not re.search(r"低有效|低电平有效|高有效|高电平有效|"
-                             r"active[\s_-]*(?:low|high)", sent, re.I):
-                continue
-            cands = re.findall(r"`([A-Za-z_]\w*)`", sent) or \
-                [t for t in re.findall(r"\b([A-Za-z_]\w*)\b", sent)
-                 if re.search(r"(?i)(rst|reset)", t)]
-            cands = [c for c in cands if not _dg._is_cell_type(c)]
-            if cands:
-                port = cands[0]
-                off_hint = 1 if re.search(
-                    r"低有效|低电平有效|active[\s_-]*low", sent, re.I) else 0
-                break
     if not port or _dg._is_cell_type(port):
         return
     if re.search(r"高有效|高电平有效|active[\s_-]*high", spec, re.I):
@@ -1191,8 +437,6 @@ def _reset_from_spec(spec, facts):
         off = 1
     else:
         off = 1 if re.search(r"(_l|_n|_b|_bar)$", port, re.I) else 0
-    if off_hint in (0, 1):
-        off = off_hint
     facts["reset"] = [{"port": port, "off_state": off}]
 
 
@@ -1332,61 +576,20 @@ def _parse_opts(tokens):
     return out
 
 
-def _closest_port(port, cands, known=None):
-    """把错误端口名映射回 spec 声明的端口（wb_clk -> wb_clk_i；唯一时钟时直取）。
-
-    known = 网表顶层端口集合（可空）。2026-11-01 变体 case 实测的回归：
-    多时钟设计里 original 声明了三个**真实存在**的时钟端口，旧实现的
-    difflib(cutoff=0.6) / 前缀匹配把它们逐个"纠正"到 spec 里的那一个 ——
-    三个时钟域塌成一个，DFTR1×528 且无法收敛。
-
-    修复口径（对应官方问答「不违反任务书即可」）：
-      · 端口真实存在于网表 → **绝不改写**（spec 没提的配置允许存在）；
-      · 前缀匹配只在候选间**无歧义**（唯一命中）时采用；
-      · difflib 模糊纠错只对**唯一候选**开放 —— 多候选时模糊匹配
-        天然有把 B 改成 A 的风险，宁可不改（SCAN-1315 至少指明了错在哪）。
-    """
+def _closest_port(port, cands):
+    """把错误端口名映射回 spec 声明的端口（wb_clk -> wb_clk_i；唯一时钟时直取）。"""
     if not cands:
         return None
     if port in cands:
         return port
-    if known and port in known:
-        return None                       # 网表真实端口，改写会弄丢一个时钟域
-    prefix_hits = [c for c in cands
-                   if c.startswith(port) or port.startswith(c)]
-    if len(prefix_hits) == 1:
-        return prefix_hits[0]
-    if len(cands) == 1:
-        # 唯一候选：前缀/模糊都对不上时也兜底（t2/c1 的 CLK -> clk 靠它纠回；
-        # 大小写不同的写法 difflib 相似度为 0，只能靠"唯一候选"这一条兜底）。
-        # 真实端口已在上面第 2 条被拦住，不会误改。
-        return cands[0]
-    return None
+    for c in cands:
+        if c.startswith(port) or port.startswith(c):
+            return c
+    m = difflib.get_close_matches(port, cands, n=1, cutoff=0.6)
+    if m:
+        return m[0]
+    return cands[0] if len(cands) == 1 else None
 
-
-
-def _closest_port_by_netlist(port, ports, spec=""):
-    """
-    端口名不在网表里时，按「唯一严格前缀/后缀关系」找真实端口。
-
-    2026-11-02 v5 实测 t2_01：original 写 `-port pad_yy_gate_clk_en`，而网表与题面
-    的真名都是 `pad_yy_gate_clk_en_b`（漏了 `_b` 后缀）。工具对未知端口**不报 ERROR**，
-    而是静默新建同名端口 —— 于是 208 个 ICG 的 SCE 全挂到假端口上，最终 0 条链，
-    日志里一个字都看不出来。
-
-    三个约束缺一不可：
-      ① 候选必须是**网表顶层端口**；
-      ② 与错误名是严格前缀/后缀关系，长度差 1~4（漏写/多写后缀的典型形态）；
-      ③ 候选必须在 **task_spec 里出现过** —— 题面认可这个真名，不是随便凑一个。
-    这样题面要求新建的虚拟端口（如 `se`）不会被误配到网表里恰好同前缀的端口上。
-    """
-    if not ports or not port or port in ports:
-        return None
-    hits = [p for p in ports
-            if (p.startswith(port) or port.startswith(p))
-            and 0 < abs(len(p) - len(port)) <= 4
-            and _spec_mentions(spec, p)]
-    return hits[0] if len(hits) == 1 else None
 
 
 def _insert_after_anchor(text, lines, anchor_re):
@@ -1582,104 +785,6 @@ def _emit_signal(stype, port, opts):
     return " ".join(parts)
 
 
-def _statement_spans(lines, prefix_re):
-    """
-    按 **Tcl 逻辑语句** 切分文本，返回 [(start, end, stmt)]（行号左闭右开）。
-
-    为什么必须这么做（2026-11-01，新 case ex3 首跑实测）：
-      任务二的 original.dofile 里时钟声明常写成跨行块
-
-          set_scan_signal -type clock -port clk -off_state 2 \\
-              -associated_internal_clocks { \\
-                  u_clk_latch/Q \\
-              }
-
-      旧实现用 `re.sub(r"^[ \\t]*set_scan_signal\\b[^\\n]*", ...)` **只替换首行**，
-      中间那行 `-associated_internal_clocks {\\ u_clk_latch/Q \\}` 被原样留在文件里，
-      工具把它当独立命令 → `[ERROR] [CMD-0074]`，流程停在 DRC 之前：
-      0 条链、无 DRC 报告、0/9 闭环。
-
-    切分规则（与工具自己的解析口径一致）：
-      · 行尾反斜杠 = 续行；
-      · `{` / `}` 未配平 = 同一条命令（Tcl 的花括号块内换行不需要续行符）。
-    """
-    spans, i, n = [], 0, len(lines)
-    while i < n:
-        if not prefix_re.match(lines[i]):
-            i += 1
-            continue
-        start = i
-        buf = [lines[i]]
-        depth = lines[i].count("{") - lines[i].count("}")
-        while i + 1 < n and (buf[-1].rstrip().endswith("\\") or depth > 0):
-            i += 1
-            buf.append(lines[i])
-            depth += lines[i].count("{") - lines[i].count("}")
-        stmt = " ".join(x.rstrip("\\").strip() for x in buf)
-        spans.append((start, i + 1, stmt))
-        i += 1
-    return spans
-
-
-# 只处理 set_scan_signal 语句（别的命令不碰）
-_SIGNAL_STMT_RE = re.compile(r"^[ \t]*set_scan_signal\b")
-
-# 分区命令：出现它们时，同一使能在不同分区各声明一次是**合法**的
-# （golden task_1/case2 就把 se_serdes 声明了 2 次、se_ctrl 3 次）。
-_PARTITION_STMT_RE = re.compile(
-    r"^[ \t]*(?:set_current_scan_partition|add_scan_partition)\b", re.M)
-
-
-def _dedup_scan_signals(text, facts):
-    """
-    删除「同 type + 同 port」的重复 set_scan_signal，只留第一条。
-
-    为什么必须做（2026-11-01 测试19，t2/c4 实测）：工具遇到重复声明会
-    `SCAN-4626 ... conflicts with previous specification. This specification is
-    discarded.` 丢弃后一条；若后一条还带冲突选项，直接升级成
-    `SCAN-1621 Failed to create signal for port`，整条命令判失败 —— 那个端口
-    等于没声明，ICG 拿不到测试使能，DRC 报 2219 条（DFTR9×2187）。
-
-    保留第一条，与工具「先写生效、后写丢弃」的实际行为一致：不把决策
-    悄悄换成被丢弃的那一条。
-
-    分区场景直接放行：`set_current_scan_partition` 之后同一使能再声明一次
-    是给不同分区用的，去重会删掉后续分区的使能配置。
-    """
-    notes = _Notes()
-    if not text or _PARTITION_STMT_RE.search(text):
-        return text, notes
-
-    lines = text.splitlines(keepends=True)
-    seen, drop = {}, []
-    for start, end, stmt in _statement_spans(lines, _SIGNAL_STMT_RE):
-        opts = _parse_opts(_TOK_RE.findall(stmt)[1:])
-        stype, port = opts.get("-type"), opts.get("-port")
-        if not stype or not port:
-            continue
-        if (stype, port) in seen:
-            drop.append((start, end))
-            notes.add(
-                "删除重复的 set_scan_signal（%s %s）" % (stype, port),
-                category="dofile_exec",
-                phenomenon="端口 %s 被重复声明为 %s，工具报 SCAN-4626 丢弃后一条；"
-                           "带冲突选项时升级为 SCAN-1621，该信号最终没建起来" % (port, stype),
-                located_object="第 %d 行的重复 set_scan_signal -type %s -port %s"
-                               % (start + 1, stype, port),
-                root_cause="同一端口出现多条 set_scan_signal 声明：工具的规格冲突检测会"
-                           "废弃后写的一条，一旦丢弃的是必需选项（如覆盖时钟门控），"
-                           "该信号就建不起来，相关时钟在测试态不可控",
-                fix_action="删除重复声明，保留第一条（与工具「先写生效」一致）",
-                violated_requirement="同一端口在同一分区内只能声明一次扫描信号规格",
-            )
-        else:
-            seen[(stype, port)] = start
-
-    for start, end in reversed(drop):
-        del lines[start:end]
-    return "".join(lines), notes
-
-
 def _fix_scan_signals(text, facts):
     """
     按 task_spec 修正每条 set_scan_signal —— **增量最小改动**。
@@ -1709,8 +814,8 @@ def _fix_scan_signals(text, facts):
     covers_icg = bool(facts.get("scan_enable_covers_icg"))
     seen = {"clock": set(), "reset": set(), "scan_enable": set(), "constant": set()}
 
-    def apply_stmt(stmt):
-        raw = stmt
+    def repl(m):
+        raw = m.group(0)
         opts = _parse_opts(_TOK_RE.findall(raw)[1:])
         stype, port = opts.get("-type"), opts.get("-port")
         if not stype or not port:
@@ -1736,77 +841,23 @@ def _fix_scan_signals(text, facts):
 
         off = opts.get("-off_state")
         if off is not None and off not in ("0", "1"):
-            # 不能一律「删掉了事」（2026-11-01，新 case ex5 实测）：
-            #   `rst_l -off_state 2` 被删掉后等于回到工具默认值 0，而 rst_l 是
-            #   低有效复位，测试态该是 1 —— 极性仍然是错的，只是从"报错"变成
-            #   "静默错"。对复位/时钟这类有极性的信号，必须按端口极性补回 0/1。
-            want_off = None
-            if stype == "reset":
-                want_off = rst_map.get(port, {}).get("off_state")
-                if want_off not in (0, 1):
-                    want_off = 1 if _dg._port_implies_active_low(port) else 0
-            elif stype == "clock":
-                want_off = 0          # 时钟测试态默认关断电平 0
-            if want_off in (0, 1):
-                notes.add(
-                    "%s 的 -off_state %s 非法（工具只允许 0/1），按极性改为 %d（%s）"
-                    % (stype, off, want_off, port),
-                    category="dofile_exec",
-                    phenomenon="set_scan_signal -type %s -port %s 的 -off_state 取值为 %s，"
-                               "超出工具允许范围（只有 1,0），命令被拒绝" % (stype, port, off),
-                    located_object="original.dofile 的 set_scan_signal -port %s 行的 -off_state %s"
-                                   % (port, off),
-                    root_cause="-off_state 参数取值非法（%s 不在 {0,1} 内），工具报 "
-                               "CMD-0074 并拒绝整条命令，%s 未生效" % (off, port),
-                    fix_action="把 %s 的 -off_state %s 改为 %d（按端口有效电平）"
-                               % (port, off, want_off),
-                )
-                opts["-off_state"] = str(want_off)
-                off = opts["-off_state"]
-            else:
-                # 极性推不出来（scan_enable / constant 这类没有"有效电平"概念）：
-                # 删掉，交回工具默认。
-                notes.add(
-                    "%s 的 -off_state %s 非法（工具只允许 0/1），删除该选项（%s）"
-                    % (stype, off, port),
-                    category="dofile_exec",
-                    phenomenon="set_scan_signal -type %s -port %s 的 -off_state 取值为 %s，"
-                               "超出工具允许范围（只有 1,0），命令被拒绝" % (stype, port, off),
-                    located_object="original.dofile 的 set_scan_signal -port %s 行的 -off_state %s"
-                                   % (port, off),
-                    root_cause="-off_state 参数取值非法（%s 不在 {0,1} 内），工具报 "
-                               "CMD-0074 并拒绝整条命令，%s 未生效" % (off, port),
-                    fix_action="删除 %s 上的非法 -off_state %s" % (port, off),
-                )
-                opts.pop("-off_state")
-                off = None
-
-        # 端口名拼写纠错（scan_enable / reset / constant）
-        # clock 分支下面另有 _closest_port 兜底；其余类型之前完全没有纠错。
-        if stype != "clock":
-            _fixed = _closest_port_by_netlist(
-                port, facts.get("netlist_ports") or set(),
-                facts.get("task_spec") or "")
-            if _fixed:
-                notes.add(
-                    "扫描%s端口 %s -> %s（网表真名，脚本漏了后缀）" % (stype, port, _fixed),
-                    category="dofile_exec",
-                    phenomenon="set_scan_signal -type %s -port %s 引用的端口在顶层设计中不存在，"
-                               "工具按原名**静默新建**端口，真实端口 %s 一个都没连上"
-                               % (stype, port, _fixed),
-                    located_object="original.dofile 的 set_scan_signal -type %s -port %s 行"
-                                   % (stype, port),
-                    root_cause="端口名拼写与网表不一致：网表顶层端口是 %s，脚本写成 %s；"
-                               "工具对未知端口不报 ERROR 而是创建同名端口，问题被完全掩盖"
-                               % (_fixed, port),
-                    fix_action="把端口名由 %s 改为 %s" % (port, _fixed),
-                    violated_requirement="扫描%s应声明在网表真实端口 %s 上" % (stype, _fixed),
-                )
-                port = _fixed
+            notes.add(
+                "%s 的 -off_state %s 非法（工具只允许 0/1），删除该选项（%s）"
+                % (stype, off, port),
+                category="dofile_exec",
+                phenomenon="set_scan_signal -type %s -port %s 的 -off_state 取值为 %s，"
+                           "超出工具允许范围（只有 1,0），命令被拒绝" % (stype, port, off),
+                located_object="original.dofile 的 set_scan_signal -port %s 行的 -off_state %s"
+                               % (port, off),
+                root_cause="-off_state 参数取值非法（%s 不在 {0,1} 内），工具报 "
+                           "CMD-0074 并拒绝整条命令，%s 未生效" % (off, port),
+                fix_action="删除 %s 上的非法 -off_state %s" % (port, off),
+            )
+            opts.pop("-off_state")
+            off = None
 
         if stype == "clock":
-            new_port = _closest_port(port, clk_ports,
-                                     known=facts.get("netlist_ports")) or port
+            new_port = _closest_port(port, clk_ports) or port
             if new_port != port:
                 notes.add(
                     "扫描时钟端口 %s -> %s（按 task_spec；否则 SCAN-1315 端口不存在）"
@@ -1823,40 +874,6 @@ def _fix_scan_signals(text, facts):
                     violated_requirement="扫描时钟应声明为 task_spec 指定的端口 %s" % new_port,
                 )
                 port = new_port
-            # 类型错配：端口被声明成时钟，但它是复位 —— 一个端口不能既当时钟又当复位。
-            # 两条证据任一成立即可改写：
-            #   ① task_spec 已把它认定为复位（rst_map 命中）；
-            #   ② 网表里它一个负载都没有（不可能驱动任何 FF 的 CLK）。
-            #
-            # 踩过的坑（泛化缺陷）：任务二注入「rst_n 漏声明复位、反而被写成时钟」，
-            # 旧实现只把 -type clock 的端口往 spec 的时钟列表上靠，靠不上就原样保留 →
-            # 「不驱动任何单元的时钟」（DFTR8×1）与「192 个 FF 复位没人声明」（DFTR3）
-            # 同时存在；更糟的是后面补声明的逻辑又补了一条 reset，同一个端口出现两次。
-            _looks_rst = bool(re.search(r"(?i)(^|_)(rst|reset)", port)) \
-                or _dg._port_implies_active_low(port)
-            _unloaded = port in (facts.get("unloaded_ports") or [])
-            if _looks_rst and (_unloaded or port in rst_map):
-                off_want = rst_map.get(port, {}).get("off_state")
-                if off_want not in (0, 1):
-                    off_want = 1 if _dg._port_implies_active_low(port) else 0
-                notes.add(
-                    "%s 被声明为时钟，但网表里无任何负载 -> 改为复位（-off_state %d）"
-                    % (port, off_want),
-                    category="drc",
-                    phenomenon="端口 %s 被声明为扫描时钟，但它在网表中不驱动任何时序单元，"
-                               "工具报「时钟无法捕获任何数据」（DFTR8），而真正挂在该端的"
-                               "触发器复位输入反而无人声明（DFTR3）" % port,
-                    located_object="original.dofile 的 set_scan_signal -type clock -port %s 行"
-                                   % port,
-                    root_cause="信号类型判错：%s 是复位输入（低有效），被误声明为扫描时钟；"
-                               "类型错了极性也就无从谈起，测试态该复位既不释放也不可控" % port,
-                    fix_action="把 set_scan_signal -type clock -port %s 改为 "
-                               "set_scan_signal -type reset -port %s -off_state %d"
-                               % (port, port, off_want),
-                    violated_requirement="复位 %s 应按其极性声明为 reset 信号" % port,
-                )
-                seen["reset"].add(port)
-                return _emit_signal("reset", port, {"-off_state": str(off_want)})
             if "-usage" in opts:
                 notes.add(
                     "删除 clock %s 上的 -usage（SCAN-1604：-usage 仅对 scan_enable 有效）"
@@ -1913,29 +930,28 @@ def _fix_scan_signals(text, facts):
 
         if stype == "scan_enable":
             cur_usage = opts.get("-usage")
-            # `-off_state 1` 对 clock_gating 用途是**合法**的（golden t1/c5：
-            #   set_scan_signal -type scan_enable -port pad_yy_icg_scan_en \
-            #       -usage clock_gating -off_state 1），所以只有 scan / all / 未写
-            # 的使能才要求功能态为 0。
-            if off is not None and off != "0" and (cur_usage or "") != "clock_gating":
-                # 功能态电平写错 → 改成 0。
-                # 【旧实现直接把 -off_state 和 -usage 一起删掉】那会把「需要覆盖
-                # 时钟门控」这条要求一并丢掉（2026-11-01 第五轮新 case：LLM 诊断
-                # 说该信号要覆盖扫描单元+ICG，产物里却只剩 -off_state 0，没有 all）。
-                opts["-off_state"] = "0"
+            if off is not None and off != "0":
+                # -off_state 非 0：这组可选参数被改坏了 → 整组删掉，恢复工具默认
+                # （缺省 usage=all，同时覆盖扫描单元与时钟门控）
+                if "-usage" in opts:
+                    opts.pop("-usage")
+                opts.pop("-off_state")
                 notes.add(
-                    "扫描使能 %s 的 -off_state %s -> 0（功能态应为 0）" % (port, off),
+                    "扫描使能 %s 的 -off_state %s 错误，删除该选项（scan_enable 无极性语义）"
+                    % (port, off),
                     category="drc",
-                    phenomenon="扫描使能 %s 上写了 -off_state %s，功能模式下该使能的关闭电平不对"
+                    phenomenon="扫描使能 %s 上多写了 -off_state %s（scan_enable 无有效电平语义），"
+                               "使该声明偏离工具默认行为，扫描模式下时钟门控无法被正确使能"
                                % (port, off),
                     located_object="original.dofile 的 set_scan_signal -type scan_enable -port %s"
                                    " 行上的 -off_state %s" % (port, off),
-                    root_cause="scan_enable 在功能模式下应为 0（扫描关闭）：写错的关闭电平会让"
-                               "工具在功能态就使能扫描路径，DRC 报时钟不可控",
-                    fix_action="把扫描使能 %s 的 -off_state %s 改为 0" % (port, off),
-                    violated_requirement="扫描使能在功能模式下应为 0",
+                    root_cause="多余且错误的 -off_state：scan_enable 不存在有效电平概念，"
+                               "该参数改变了工具的默认使能/覆盖行为，导致时钟门控（ICG）"
+                               "在测试模式下未被使能，DRC 报时钟不可控",
+                    fix_action="删除扫描使能 %s 上多余的 -off_state %s" % (port, off),
+                    violated_requirement="扫描使能应覆盖扫描单元与时钟门控（工具默认 usage=all）",
                 )
-                if cur_usage and cur_usage != "all" and covers_icg:
+                if cur_usage and cur_usage != "all":
                     notes.add(
                         "扫描使能 %s 的 -usage %s 覆盖范围不足" % (port, cur_usage),
                         category="drc",
@@ -1947,11 +963,10 @@ def _fix_scan_signals(text, facts):
                         root_cause="scan_enable 的 -usage 取值过窄（%s）：只覆盖了部分目标，"
                                    "时钟门控单元的控制引脚未被该使能驱动，测试模式下无法使能"
                                    % cur_usage,
-                        fix_action="把 %s 的 -usage %s 改为 all（显式覆盖扫描单元与时钟门控）"
+                        fix_action="删除 %s 上取值过窄的 -usage %s，恢复工具默认 usage=all"
                                    % (port, cur_usage),
                         violated_requirement="扫描使能需同时覆盖扫描单元与时钟门控（usage=all）",
                     )
-                    opts["-usage"] = "all"
             elif cur_usage and cur_usage != "all" and (
                     covers_icg or se_map.get(port, {}).get("usage") == "all"):
                 notes.add(
@@ -1968,38 +983,6 @@ def _fix_scan_signals(text, facts):
                     violated_requirement="扫描使能需同时覆盖扫描单元与时钟门控（usage=all）",
                 )
                 opts["-usage"] = "all"
-            # `-usage scan` 的去留交给生成侧同一条判据（_resolve_se_usage）：
-            # 12 份参考实现里只有 t1/c5 写 scan（它另有 pad_yy_icg_scan_en
-            # -usage clock_gating 专管门控），其余 11 份一律省略。省略时工具按默认
-            # 覆盖时钟门控，ICG 的 TE 才拿得到测试使能 —— t2/c4 实测写 `-usage scan`
-            # 会让 2187 个 FF 的时钟在测试态不活跃（DFTR9），链数从 24 掉到 2。
-            # 【2026-11-01 测试19 回归】上一版只把 scan 提升为 all、不提升时原样留着，
-            # 于是 LLM 补丁带进来的 `-usage scan` 就一路落到了 final.dofile。
-            if (opts.get("-usage") or "").lower() == "scan":
-                try:
-                    _resolved_usage = _dg._resolve_se_usage(
-                        {"port": port, "usage": "scan"},
-                        facts.get("scan_enable") or [],
-                        facts.get("_spec_text") or "",
-                        facts)
-                except Exception:                            # noqa: BLE001
-                    _resolved_usage = "scan"    # 判据异常时保持原样，不贸然删
-                if not _resolved_usage:
-                    notes.add(
-                        "扫描使能 %s 的 -usage scan 删除（按参考实现省略）" % port,
-                        category="drc",
-                        phenomenon="扫描使能 %s 上写了 -usage scan，只覆盖新插链的扫描单元，"
-                                   "时钟门控的 TE 引脚拿不到测试使能" % port,
-                        located_object="original.dofile 的 set_scan_signal -type scan_enable "
-                                       "-port %s 行的 -usage scan" % port,
-                        root_cause="该使能是本设计唯一的扫描使能，题面要求它同时兼顾时钟门控；"
-                                   "-usage scan 把覆盖范围收窄到扫描单元，ICG 在测试态不导通，"
-                                   "时钟不可控（DFTR9）",
-                        fix_action="删除 %s 的 -usage scan，回到工具默认"
-                                   "（同时覆盖扫描单元与时钟门控）" % port,
-                        violated_requirement="唯一扫描使能需同时覆盖扫描单元与时钟门控",
-                    )
-                    opts.pop("-usage", None)
             seen["scan_enable"].add(port)
             return _emit_signal("scan_enable", port, opts)
 
@@ -2025,17 +1008,7 @@ def _fix_scan_signals(text, facts):
 
         return raw
 
-    # 按「逻辑语句」重写：续行块整体替换成单行，绝不把中间行留在文件里。
-    # 不需要改的语句**原样保留**（不合并），避免无谓的排版 diff。
-    lines = text.split("\n")
-    spans = _statement_spans(lines, _SIGNAL_STMT_RE)
-    if spans:
-        out = list(lines)
-        for start, end, stmt in reversed(spans):
-            fixed_stmt = apply_stmt(stmt)
-            if fixed_stmt and fixed_stmt != stmt:
-                out[start:end] = [fixed_stmt]
-        text = "\n".join(out)
+    text = re.sub(r"^[ \t]*set_scan_signal\b[^\n]*", repl, text, flags=re.M)
 
     # 补齐 spec 要求、dofile 里整段没有的声明（task_2/case5：original 没有配置段）。
     # 同样遵守「不添新」原则：只写 task_spec / 网表能确证的值。
@@ -2105,77 +1078,6 @@ def _fix_scan_signals(text, facts):
                            % ",".join(miss["scan_enable"]),
                 violated_requirement="需声明扫描使能信号 Scan Enable",
             )
-    return text, notes
-
-
-def _fix_explicit_switches(text, facts):
-    """
-    按任务书**明写**的极性，改写已有的 `-mix_clocks` / `-mix_edges`。
-
-    为什么必须单独一条（2026-10-31 新 case 的 t2/c1、t2/c2）：任务二从
-    original.dofile 出发，里面写着 `-mix_clocks true`，而题面是「不混时钟域」——
-    那个 true 本身就是注入的缺陷之一。`_fix_scan_cfg` 的口径是"只补不覆盖"
-    （防止污染分区级配置），于是这条错误一直留着，链域混插，golden 是 false。
-    这里只做**已有键的取值纠正**，不新增键、不动分区级行。
-    """
-    notes = _Notes()
-    spec = (facts.get("task_spec") if isinstance(facts, dict) else "") or ""
-    if not spec:
-        return text, notes
-    want = {}
-    if re.search(r"不混(?:合)?(?:时钟)?域", spec) or re.search(
-            r"(?:不允许|不得|禁止|不可)[^\n]{0,12}混合[^\n]{0,12}时钟域", spec) \
-            or re.search(r"不得跨时钟域|不可跨时钟域|不允许跨时钟域", spec):
-        want["mix_clocks"] = "false"
-    elif re.search(r"允许[^\n]{0,12}混合[^\n]{0,12}(?:同一条|同一)\s*scan\s*chain", spec, re.I):
-        want["mix_clocks"] = "true"
-    if re.search(r"不混[^\n]{0,6}沿|(?:不允许|不得|禁止|不可)[^\n]{0,12}沿混合", spec):
-        want["mix_edges"] = "false"
-    elif re.search(r"允许[^\n]{0,12}混[^\n]{0,6}沿", spec):
-        want["mix_edges"] = "true"
-
-    out = text
-    for opt, val in want.items():
-        pat = re.compile(r"(-%s\s+)(true|false)" % re.escape(opt), re.I)
-        def _sub(m, _v=val, _o=opt):
-            if m.group(2).lower() == _v:
-                return m.group(0)
-            notes.append("%s %s -> %s（按任务书原文）" % (_o, m.group(2), _v))
-            return m.group(1) + _v
-        out = pat.sub(_sub, out)
-    return out, notes
-
-
-def _fix_partition_chain_counts(text, facts):
-    """
-    按题面纠正每个分区的 -chain_count / -max_length（任务二）。
-
-    2026-10-31：v4 的 t2/c3 题面是 `| 分区 | -clocks | chain_count | max_length |` 表，
-    original.dofile 里三个分区共用一条 `-chain_count 20`，我们只改了 -clocks 没改链数，
-    结果 20 条全局，验收要 34/1/1。
-    只改**已存在**的 set_current_scan_partition 段，不新增分区。
-    """
-    notes = _Notes()
-    for p in facts.get("partitions") or []:
-        name = p.get("name")
-        cc = p.get("chain_count")
-        if not name or not cc:
-            continue
-        m = re.search(r"set_current_scan_partition\s+%s\b[^\n]*\n([^\n]*)"
-                      % re.escape(name), text)
-        if not m:
-            continue
-        body = m.group(1)
-        new_body = re.sub(r"(-chain_count\s+)\d+",
-                          lambda mm: mm.group(1) + str(cc), body, count=1)
-        if p.get("max_length"):
-            new_body = re.sub(r"(-max_length\s+)\d+",
-                              lambda mm: mm.group(1) + str(p["max_length"]),
-                              new_body, count=1)
-        if new_body != body:
-            text = text[:m.start(1)] + new_body + text[m.end(1):]
-            notes.append("分区 %s 的链参数改为 chain_count=%s（按 task_spec）"
-                         % (name, cc))
     return text, notes
 
 
@@ -2320,14 +1222,6 @@ def _fix_scan_cfg(text, facts):
     text = "\n".join(out)
 
     if not seen_global:
-        # 不建链的脚本（只有 -connect_icg_only / -replace_only / -replace_unscan）
-        # 不该有 set_scan_cfg：链数/链长/边沿策略/lockup 全是**建链**参数，
-        # 在这一阶段写进去只会与参考结果产生配置差异（task_1/case1、case4 的
-        # golden 都完全没有 set_scan_cfg）。旧实现无条件合成一条，给
-        # 「不涉及扫描链」的任务塞了 `-internal_clocks none -mix_clocks false
-        # -mix_edges false -add_lockup true`，凭空和 golden 差 3~4 项。
-        if _dg.dofile_builds_chain(text) is False:
-            return text, notes
         # original 整段没有 set_scan_cfg（task_2/case5 的 original 只有 load/present/
         # examine/insert）-> 按 task_spec + 工具的保守默认值合成一条全局配置
         synth = []
@@ -2743,40 +1637,6 @@ def _drop_unrequired(text, facts):
 # 主入口
 # ---------------------------------------------------------------------------
 
-def align_internal_clocks(task, dofile_text):
-    """
-    按题面校正**全局** `set_scan_cfg -internal_clocks` 的取值。
-
-    2026-11-02 v5 实测 `t2_04_ac97_partition`：题面第 40 行写「全局 `set_scan_cfg`
-    含 `-internal_clocks multi`」，original 却写成 `single`。取错档位会改变工具对
-    门控时钟的识别粒度（single = 任意组合逻辑门后 / multi = 多输入门后），
-    直接影响成链与 DRC。
-
-    只动**第一条** set_scan_cfg（到下一个 set_scan_cfg 之前），那是全局配置；
-    分区级的 set_scan_cfg 由各自分区管，不能碰。
-    """
-    if not dofile_text:
-        return dofile_text
-    spec = (task or {}).get("task_spec", "") or ""
-    want = _dg.internal_clocks_from_spec(spec)
-    if not want:
-        return dofile_text
-    m = re.search(r"(?m)^[ \t]*set_scan_cfg\b", dofile_text)
-    if not m:
-        return dofile_text
-    nxt = dofile_text.find("set_scan_cfg", m.end())
-    end = nxt if nxt > 0 else len(dofile_text)
-    seg = dofile_text[m.start():end]
-    got = re.search(r"-internal_clocks\s+(\w+)", seg)
-    if not got or got.group(1) == want:
-        return dofile_text
-    seg2 = re.sub(r"-internal_clocks\s+\w+", "-internal_clocks " + want,
-                  seg, count=1)
-    print("  ↻ 全局 set_scan_cfg：-internal_clocks %s -> %s（按题面）"
-          % (got.group(1), want))
-    return dofile_text[:m.start()] + seg2 + dofile_text[end:]
-
-
 def fix_scan_cfg(task, dofile_text):
     """
     只做 set_scan_cfg 的规格校对（供 dofile_generator.ensure_scan_cfg_from_spec 复用）。
@@ -2824,13 +1684,8 @@ def fix_to_spec(task, dofile_text, facts=None):
 
     notes = _Notes()
     text = dofile_text
-    for fn in (_fix_load_netlist, _fix_cell_mapping,
-               # 先去重再规范化：同一端口的两条声明若都留着，后面按 spec 逐条修正
-               # 会把两条都"改对"，产物里仍是两条冲突声明（SCAN-1621）。
-               _dedup_scan_signals, _fix_scan_signals,
-               _fix_partitions, _fix_partition_chain_counts,
-               _fix_scan_cfg, _fix_explicit_switches,
-               _fix_scan_elements, _fix_drc,
+    for fn in (_fix_load_netlist, _fix_cell_mapping, _fix_scan_signals,
+               _fix_partitions, _fix_scan_cfg, _fix_scan_elements, _fix_drc,
                _drop_unrequired):
         try:
             text, n = fn(text, facts)
