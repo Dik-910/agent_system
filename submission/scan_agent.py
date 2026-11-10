@@ -20,6 +20,7 @@ Scan Insertion Agent - 主入口
 
 import argparse
 import json
+from concurrent.futures import ThreadPoolExecutor
 import os
 import re
 import shutil
@@ -39,6 +40,7 @@ try:
     from . import netlist_analyzer
     from . import manual_rag
     from . import lec_verifier
+    from . import llm_eco
     from . import netlist_facts
     from . import spec_verifier
     from . import spec_fixer
@@ -57,6 +59,7 @@ except ImportError:
     import manual_rag
     import netlist_facts
     import lec_verifier
+    import llm_eco
     import spec_verifier
     import spec_fixer
     import task2_diagnoser
@@ -337,39 +340,82 @@ def pre_run_deadline(task, tool_reserve=None):
     return _RUN_STARTED_AT + window
 
 
-# LLM 结构化理解的启用阈值（秒）。
+# LLM 结构化理解的思考档位选择。
 #
-# 多数 case 的 wall time 预算只有 150s，而 LLM 理解单次实测 62.9~68.0s；
-# 「理解 + 生成」两次 LLM 调用会吃满预算，dftexp_scan 一次都跑不起来（= 0 分）。
-# 只有预算充裕的 case（如 t1/case5 特批 4800s）才额外用 LLM 做结构化理解，
-# 取其语义抽取之长；其余 case 用 0.00s 的规则抽取（字段覆盖一致）。
+# 【2026-10-28 复核】这里同时管两件事，一定要分开看：
+#   1) 用不用 LLM 理解 —— 几乎总是用。赛题是「基于大语言模型的智能体」，
+#      任务书语义解析（哪段是设计描述、哪段是配置要求、单时钟域怎么配）
+#      本来就该 LLM 干。规则抽取降级为**兜底**（merge_understanding 补空字段）。
+#   2) 这次理解开不开思考 —— 按可用窗口自适应。
+#
+# 实测基线（deepseek-v4-pro-0813，同一 prompt）：
+#     开思考 62.9~68.0s     关思考 6.4~7.4s
+# 关思考**仍然是调用 LLM**（同模型、同 API，只是不输出 reasoning_content），
+# 区别只是推理强度。所以「关思考」不等于「退回规则」。
+#
+# 为什么要自适应而不是写死：预算模型算的是
+#     window = min(budget*0.92, cap, budget*0.9 - tool_reserve)
+# 小网表（reserve 15s）+ 150s 预算 → 窗口 120s，开思考装得下；
+# 大网表（reserve 90s）+ 150s 预算 → 窗口仅 45s，开思考（62s）**装不进**，
+# 硬开会让 LLM 被流式守护砍掉、白烧一轮，最后连 dofile 都出不来。
+# 所以：窗口宽裕就用高质量档，紧就用快档，实在装不下才不用 LLM。
+#
+# 阈值依据（2026-10-28 二次调整）：
+#   ≥ _LLM_UNDERSTAND_THINK_MIN_S  → 开思考
+#   ≥ _LLM_UNDERSTAND_FAST_MIN_S   → 关思考（**默认**，装得下就值得用）
+#   <  _LLM_UNDERSTAND_FAST_MIN_S  → 不用 LLM 理解，纯规则
+#
+# 【为什么把开思考的门槛抬到"实际不会触发"】评分维度含**时间与 token**，
+# 而开思考的耗时不确定性太大：同一 prompt 实测 54s（reasoning_effort=low）、
+# 62~68s（正常）、>400s（不返回），reasoning tokens 2707 起。
+# 关键经验：那个"想"并不在做 DFT 判断 —— 抓 reasoning 原文看过，2000+ tokens
+# 全花在猜 JSON 字段该填什么，而且填错了。把 prompt 写清楚（字段定死 +
+# 网表事实预填）之后，关思考 6~7s 就能给出正确结果（t1/case5、case6 实测一致）。
+# 所以默认走快档；需要极限质量时用 SCAN_AGENT_LLM_UNDERSTAND_THINK_MIN=110 打开。
+_LLM_UNDERSTAND_THINK_MIN_S = float(
+    os.environ.get("SCAN_AGENT_LLM_UNDERSTAND_THINK_MIN", "1e9"))
+_LLM_UNDERSTAND_FAST_MIN_S = float(
+    os.environ.get("SCAN_AGENT_LLM_UNDERSTAND_FAST_MIN", "30"))
+# 兼容旧变量名：老配置若只设了 MIN_BUDGET，仍按「能否用 LLM」处理。
 _LLM_UNDERSTANDING_MIN_BUDGET_S = float(
-    os.environ.get("SCAN_AGENT_LLM_UNDERSTAND_MIN_BUDGET", "600"))
+    os.environ.get("SCAN_AGENT_LLM_UNDERSTAND_MIN_BUDGET",
+                   str(_LLM_UNDERSTAND_FAST_MIN_S)))
 
 
 def llm_understanding_affordable(task):
-    """预算是否足够撑起「LLM 理解 + LLM 生成 + 至少一轮工具」的完整链路。"""
-    budget = ((task or {}).get("limits") or {}).get("max_wall_time_s")
+    """预运行窗口是否塞得下「LLM 理解 + LLM 计划 + 至少一轮工具」。"""
     try:
-        return float(budget or 0) >= _LLM_UNDERSTANDING_MIN_BUDGET_S
-    except (TypeError, ValueError):
+        window = pre_run_window_s(task)
+    except Exception:                                       # noqa: BLE001
         return False
+    return float(window or 0) >= _LLM_UNDERSTAND_FAST_MIN_S
+
+
+def llm_understanding_thinking(task):
+    """
+    本次理解调用是否开思考。
+
+    返回 True/False（给 llm.chat 的 thinking 参数）。
+    窗口宽裕开思考（语义判断更稳），紧张就关思考（快档，质量够用）。
+    """
+    try:
+        window = pre_run_window_s(task)
+    except Exception:                                       # noqa: BLE001
+        return False
+    return float(window or 0) >= _LLM_UNDERSTAND_THINK_MIN_S
 
 
 def merge_understanding(base, fallback):
     """
     以 base（LLM 理解）为主、fallback（规则抽取）为兜底，逐字段补齐。
 
-    规则抽取是确定性的（覆盖 task_spec 的表格与要求句），用它兜底可避免
-    LLM 漏抽某字段导致整段配置丢失；LLM 已抽到的字段优先保留。
+    【已下沉】真正的实现移到 dofile_generator.merge_understanding（2026-10-28）。
+    原因：这个函数是「理解层合并」的语义，属于 dofile_generator 的职责；
+    留在 scan_agent 里导致测试脚本 import 不到，脚本于是退化成纯规则草稿，
+    而生产链路走 LLM —— 两边不是同一条路，测出来的结果没有参考价值。
+    这里保留一个转发，兼容既有调用方。
     """
-    if not base:
-        return dict(fallback or {})
-    out = dict(base)
-    for k, v in (fallback or {}).items():
-        if out.get(k) in (None, "", [], {}):
-            out[k] = v
-    return out
+    return dofile_generator.merge_understanding(base, fallback)
 
 
 def _llm_guard(llm, deadline):
@@ -457,27 +503,92 @@ def _dofile_text_of_run(run):
         return ""
 
 
+def retry_not_worthwhile(task, run_cost, violations, prev_violations,
+                        cost_ratio=0.15, min_drop=0.10):
+    """
+    再跑一轮工具是否还值得 —— **只依赖预算与进展，不依赖任务类型/轮次**。
+
+    判据（两条同时成立才算"不值得"）：
+      ① 本轮的工具体耗时 > 预算 × cost_ratio（默认 15%）；
+      ② 违例规模没有实质下降（下降幅度 < min_drop）。
+    首次运行（prev_violations 为 None）永远返回 False —— 没有基线就没法谈"下降"。
+
+    为什么放在顶层、而不是某个流程的循环里（2026-10-27）：
+      这套判据本质是"时间预算 vs 收益"，与"这是生成型还是修复型流程"无关。
+      评测随时可能换成 task_3、或者不分任务直接给 case；把刹车写进某个具体
+      循环，等于把"任务编号"当成系统不变量。放在这里，任何流程都能调。
+
+    依据：测试10/t1/case5 单轮 370s，违例 89656 → 124415 → 89656，5 轮烧掉
+    1850s；这个量级不是"再调一版配置"能修的。
+    """
+    if prev_violations is None or not run_cost:
+        return False
+    budget = float(((task or {}).get("limits") or {}).get("max_wall_time_s") or 0)
+    if not budget:
+        return False
+    if run_cost <= cost_ratio * budget:
+        return False
+    return violations >= prev_violations * (1.0 - min_drop)
+
+
 def _mark_resolved(fix_records, run_id):
     """
     标记「某轮跑通即证明已消除」的问题闭环（issue_resolutions 的 verify 证据）。
 
-    两类记录：
-      · _auto_verify —— 首轮工具运行**之前**就已修复的注入故障（任务二的主力），
-        跑通即验证通过；
-      · 上一轮的运行中修复 —— 本次跑通即验证通过。
-    另外把最后一条未 resolved 的记录也一并标记，与原有行为保持一致。
+    2026-11-01 修正（新 case ex5 实测 0/13 闭环）：
+      旧实现只标 `_auto_verify` 和**最后一条**，于是「R1 发现的 5 个问题、
+      R2 全修好、R3 跑通」这种情况只有 1 条被标 resolved，其余 4 条永远 false ——
+      按 5.5.2-3「正确闭环的 issue 数 / 预设总问题数 ≥90%」直接丢 15 分。
+
+    正确判据：本轮（R{run_id}）工具跑通 ⟹ **所有在更早轮次已应用**的修复都被验证。
+    还没应用的（applied_run 为空或晚于本轮）不能算。
     """
     if not fix_records:
         return
     verified = f"R{run_id}"
-    last = fix_records[-1]
+    try:
+        cur = int(str(run_id).lstrip("Rr"))
+    except (TypeError, ValueError):
+        cur = 0
     for rec in fix_records:
         if rec.get("resolved"):
             continue
-        if rec.get("_auto_verify") or rec is last:
+        ar = str(rec.get("applied_run") or "")
+        m = re.match(r"[Rr](\d+)", ar)
+        applied_before = bool(m) and int(m.group(1)) <= cur
+        if rec.get("_auto_verify") or applied_before:
             rec["resolved"] = True
             rec["verified_run"] = verified
             rec["verified_source"] = f"runs/{verified}/{verified}.log"
+
+
+def delivery_assertions(output_dir, task_type="task1", has_netlist_change=False):
+    """
+    写 `.case_complete_marker` 之前的**交付断言**（规范第 84-90 行的交付物清单）。
+
+    为什么要（新 case ex3 首跑）：那一轮 `[Run 1] 有问题：errors=1` → 直接
+    "✓ 任务二完成" 并落了 marker，产物是 0 条链、没有 DRC 报告、没有 post_scan.v。
+    平台把它记成「按时完成但产物不合格」，而不是「失败」—— 连"没做完"都看不出来。
+
+    Returns: 缺失项列表（空 = 齐全）。不阻断 marker 写入（不写会判超时）。
+    """
+    out = Path(output_dir)
+    fr = out / "final_results"
+    missing = []
+    if not (fr / "deliverables" / "final.dofile").exists():
+        missing.append("final_results/deliverables/final.dofile")
+    reps = fr / "reports"
+    if not reps.exists() or not any(reps.iterdir()):
+        missing.append("final_results/reports/（Dofile 要求的各类报告）")
+    if not (fr / "final.log").exists():
+        missing.append("final_results/final.log")
+    if not (out / "decision_log.json").exists():
+        missing.append("decision_log.json")
+    if task_type == "task2":
+        # 改过网表就必须有等价性报告（规范第 90 行 + 5.4.1-3）
+        if not (reps / "lec_report.rpt").exists() and has_netlist_change:
+            missing.append("final_results/reports/lec_report.rpt（改过 pre-scan 网表）")
+    return missing
 
 
 def _persist_incremental(output_dir, task, run_results,
@@ -741,6 +852,9 @@ def normalize_dofile_layout(task, understanding, dofile, is_task2=False):
 
     任务一额外做基础命令完整性校验（缺命令则回退规则模板）。
     """
+    # 重复挂载前缀先收敛（/input/input/x -> /input/x）：这条路一旦写错，
+    # 工具报 COM-3301/CMD-3038，后面几十条命令连锁失败，整轮白跑。
+    dofile = dofile_generator.collapse_duplicated_mount(dofile)
     dofile = dofile_generator.ensure_output_vars(dofile)
     dofile, _usage_notes = dofile_generator.fix_scan_signal_usage(dofile)
     for _n in _usage_notes:
@@ -748,7 +862,19 @@ def normalize_dofile_layout(task, understanding, dofile, is_task2=False):
     # 顶层名是不变量：修复循环里 LLM 可能把正确的 present_design 改成 task_spec 的
     # 「设计名称」（case6：des3 → des_perf，直接把能跑的 dofile 改坏）。
     # task["top_module"] 已由 _apply_top_from_facts 用**网表结构**校正过，这里强制回写。
+    #
+    # 但**修复路径（task2）以前从不调用 _apply_top_from_facts** —— 那条校正只在
+    # 生成路径里做，于是 task["top_module"] 一直是 task_spec 的「设计名称」，
+    # enforce_top_module 按这个错名回写，等于把 original 的错误固定下来。
+    # 2026-11-02 v5 实测 `t2_05_desperf_sff_eco`：网表文件 des_perf.v、真实顶层 des3，
+    # original 写 `present_design des_perf` → COM-3008，我们原样交付，整 case 失败。
+    _nf_top = str(((task or {}).get("_facts") or {}).get("top") or "").strip()
+    if _nf_top and _nf_top != (task.get("top_module") or ""):
+        dofile_generator._apply_top_from_facts(task, understanding, task["_facts"])
     dofile = dofile_generator.enforce_top_module(dofile, task)
+    # 没有 _facts.top 时（大网表跳过抽取）再退一步：现算一次网表顶层。
+    if not _nf_top:
+        dofile = spec_fixer.ensure_present_design(task, dofile)
     if dofile_generator.has_relative_input_path(dofile):
         fixed = dofile_generator.fix_input_paths_to_absolute(dofile, task)
         if fixed and not dofile_generator.has_relative_input_path(fixed):
@@ -765,10 +891,41 @@ def normalize_dofile_layout(task, understanding, dofile, is_task2=False):
         # load_netlist，首轮必报 22 个 ERROR 连锁失败；旧代码只靠 LLM 补丁在 R3 才修好，
         # 白烧两轮工具调用，且 LLM 一旦不稳定就直接卡死在「错误签名相同」。
         # 这些故障的正确值全部写在 task_spec 里，属确定性修复，不该赌 LLM。
-        dofile, spec_notes = spec_fixer.fix_to_spec(task, dofile)
+        # ★ 2026-11-01：修复器本身也可能被新题面写法搞崩（正则/表格结构没覆盖到），
+        #   那不该连累整个 case —— 抛异常就保留原 dofile 继续，让后续轮次去修。
+        try:
+            dofile, spec_notes = spec_fixer.fix_to_spec(task, dofile)
+        except Exception as _sfx:                               # noqa: BLE001
+            print(f"  ⚠ 规格修复失败（{type(_sfx).__name__}: {_sfx}），保留原 dofile 继续")
+            spec_notes = []
         for n in spec_notes:
             print(f"  ⚠ 规格修复：{n}")
     dofile = dofile_generator.enforce_workflow_stage_order(dofile)
+    # 题面明确要求"ICG 级联 / 门控初始化周期"时补 set_scan_drc_cfg。
+    # task1 是生成路径，以前完全不写这条；task2 由 _fix_drc 兜底，这里幂等。
+    # 前置处理型（三步）：original 若被删掉某个 insert_dft_logic -xxx_only，
+    # 修复侧以前完全没有补回逻辑（生成侧一直是对的）。
+    # 用「网表事实 + 题面依据」补漏声明：只在某类声明完全为空时才补，
+    # 多候选/层次路径/题面排除的一律不动（详见函数 docstring）。
+    dofile = spec_fixer.ensure_signal_declarations(task, dofile)
+    # 题面用「时钟域表格」列了多个域时的漏声明补齐（已有部分声明也补）。
+    dofile = spec_fixer.ensure_clock_domain_decls(task, dofile)
+    # 分区用 `-clocks` 时按题面「分区名（时钟名，…」对齐（必须在补声明之后，
+    # 否则目标时钟还没声明，函数会因"未声明"跳过）。
+    dofile = spec_fixer.ensure_partition_clocks(task, dofile)
+    # 分区级链路预算（-chain_count / -max_length）按题面「分区（时钟，N 链，≤M）」校正。
+    dofile = spec_fixer.ensure_partition_chain_count(task, dofile)
+    dofile = spec_fixer.ensure_workflow_steps(task, dofile, understanding)
+    dofile = spec_fixer.force_replace_true(task, dofile, understanding)
+    # 还原被注入故障"复制成同一个"的多时钟声明（只在该端口确实重复时触发）
+    dofile = spec_fixer.restore_duplicated_clock_ports(task, dofile)
+    dofile = spec_fixer.ensure_cell_mappings(task, dofile)
+    dofile = spec_fixer.ensure_drc_cfg(task, dofile)
+    # 全局 `set_scan_cfg -internal_clocks` 按题面校正。
+    # 任务二不走下面的 ensure_scan_cfg_from_spec（注释说"已由 fix_to_spec 完成"），
+    # 而 fix_to_spec 的 `_fix_scan_cfg` 根本不碰这个选项 —— v5 t2_04 题面要 multi、
+    # original 写 single，一路漏到产物里。这里补一道，放在两条路径都经过的位置。
+    dofile = spec_fixer.align_internal_clocks(task, dofile)
     dofile = dofile_generator.place_drc_configs_before_examine(dofile)
     if not is_task2:
         # 任务二的 set_scan_cfg 规格校对已由上面的 spec_fixer.fix_to_spec 完成，
@@ -780,6 +937,35 @@ def normalize_dofile_layout(task, understanding, dofile, is_task2=False):
     dofile, dropped = dofile_generator.sanitize_clock_ports(dofile, task)
     if dropped:
         print("  ⚠ 移除非端口的时钟声明：" + "、".join(dropped))
+    # 最后一道：实例引用回查网表（短名补全层级路径、删除不存在的引脚）。
+    # 任务二与修复循环里的 LLM 补丁都不经过 understanding，只能在文本上收口。
+    dofile, ref_notes = dofile_generator.fix_instance_refs_in_text(
+        dofile, task, facts=task.get("_facts") or None)
+    for n in ref_notes[:6]:
+        print(f"  ⚠ {n}")
+    if len(ref_notes) > 6:
+        print(f"  ⚠ …另有 {len(ref_notes) - 6} 处引用修正")
+    return dofile
+
+
+def _task2_sanitize(task, understanding, dofile):
+    """
+    任务二的 dofile 收尾：布局规范化 + **任务书要求的信号必须声明**。
+
+    为什么单独抽出来：任务二走的是「改别人注入了故障的 dofile」这条路，
+    它不经过 ensure_dofile_integrity（那是任务一的函数）。结果就是
+    ensure_required_signals 只对任务一生效 —— 而 t2_led_drv 那种
+    「把 scan_mode 常量声明整行删掉、只留注释」的注入故障，恰好只出现在任务二，
+    于是补声明从来没跑过：dofile 里只剩注释，仿真时 scan_mode 是未知态，
+    ECO 改了 mux 也看不出效果，三轮违例不降。
+    """
+    dofile = normalize_dofile_layout(task, understanding, dofile, is_task2=False)
+    if not dofile:
+        return dofile
+    dofile, notes = dofile_generator.ensure_required_signals(
+        dofile, task, understanding, facts=task.get("_facts") or None)
+    for n in notes:
+        print(f"      ↻ {n}")
     return dofile
 
 
@@ -789,13 +975,28 @@ def ensure_dofile_integrity(dofile, task, understanding):
 
       1. 输出目录变量 / 输入路径 / 工作流顺序 / DRC 配置位置规范化；
       2. 检查 REQUIRED_CMDS，缺任意一个 -> 回退规则模板；
-      3. 补齐缺失的报告 / 网表 / CTL / SCANDEF（仅补 task_spec 确实要求的）。
+      3. 补齐缺失的报告 / 网表 / CTL / SCANDEF（仅补 task_spec 确实要求的）；
+      4. **任务书要求的扫描信号必须真的声明出来** —— 缺了就补
+         （task_2 注入故障常把某条 set_scan_signal 整行删掉、只留注释，
+          修复逻辑若只改别的行，dofile 里就只剩注释，仿真时该信号是未知态，
+          ECO 效果看不到、DRC 一条不降）。
 
     Returns:
         str: 处理后的 dofile
     """
     dofile = normalize_dofile_layout(task, understanding, dofile, is_task2=False)
-    return pad_missing_artifacts(dofile, task, only_explicit_exports=True)
+    dofile = pad_missing_artifacts(dofile, task, only_explicit_exports=True)
+
+    # 复用预运行阶段已经抽好的网表事实：ensure_required_signals 内部会
+    # `ensure_facts(task, facts)`，不传就**重新抽一遍**。大网表上这一遍
+    # 是纯浪费 —— task_1/case5（271MB / 65 万 FF）本地实测 31s、平台 ~60s，
+    # 而这一步只需要「哪些端口是顶层端口」这类已有结论。
+    _facts = task.get("_facts") or None
+    fixed, notes = dofile_generator.ensure_required_signals(
+        dofile, task, understanding, facts=_facts)
+    for n in notes:
+        print(f"  ↻ {n}")
+    return fixed
 
 
 
@@ -840,45 +1041,122 @@ def _run_task1_impl(input_dir, output_dir, llm):
         #    而不仅是任务书措辞。这是「真正的分析」：public 与 hidden case 依赖
         #    同一份事实，不存在「public 靠 golden 抄答案、hidden 抓瞎」的两套逻辑。
         #    规模自适应 + 截止时间保护，最坏情况退化为空事实，不影响主流程。
-        facts = dofile_generator.ensure_facts(
-            task, deadline=pre_deadline, want_chains=True)
+        #    **与 2.5 的 LLM 理解并行**：facts 是纯 CPU 计算（解析 271MB 网表），
+        #    LLM 调用是纯网络等待；GIL 在 IO 等待期间释放，两者能真正重叠。
+        #    实测 t1/case5（650074 FF）：串行 42.8s -> 并行 32.9s；小网表 facts
+        #    本身只有 0.1~2s，并行收益接近 0 但也不亏（线程立刻返回）。
+        _facts_exec = ThreadPoolExecutor(max_workers=1)
+        _facts_fut = _facts_exec.submit(
+            dofile_generator.ensure_facts, task,
+            deadline=pre_deadline, want_chains=True)
+
+        # 2.5 结构化理解 —— 为 LLM 生成 dofile 准备输入
+        #
+        # 【定位】本系统是「基于大语言模型的 Scan Insertion 智能体」：最终 dofile
+        # 由 LLM 依据「任务说明书 + 网表事实 + 手册检索(RAG) + 命令白名单」决策并
+        # 写出（见 dofile_generator.generate_dofile → plan_with_llm → generate_from_config）。
+        # 结构化理解是 LLM 的**第一道语义输入**，不是规则引擎的中间产物。
+        #
+        # 【分工】LLM 读任务书 → 规则抽取只做两件事：
+        #   · 兜底补齐 LLM 漏掉的字段（merge_understanding 逐字段补空）；
+        #   · 用网表事实压制任务书里过时/笔误的措辞（apply_facts_precedence）。
+        # 规则不再抢在主路径上先产出一份「很可能正确」的草稿让 LLM 只做校对 ——
+        # 那样 LLM 的判断会被草稿锚住，系统实质退化成规则引擎加装饰。
+        #
+        # 【思考档位】按预运行窗口自适应（见 llm_understanding_thinking）：
+        #   窗口 ≥110s → 开思考（62~68s，语义判断更稳）；
+        #   窗口 30~110s → 关思考（6~7s，仍是 LLM，只是快档）；
+        #   窗口 <30s → 装不下任何一次调用，纯规则兜底（此时连工具都紧张）。
+        # LLM 理解不依赖网表事实（只读 task_spec 与端口表），先发出去；
+        # 它跑的同时后台的 facts 抽取也在推进。
+        llm_u = None
+        _u_think = False
+        if llm.available and llm_understanding_affordable(task):
+            _u_think = llm_understanding_thinking(task)
+            llm_u = input_parser.extract_task_understanding(
+                task, llm, thinking=_u_think)
+
+        # 取后台结果（若 LLM 更慢，这里已经算完；反之也能省掉 LLM 那段时间）
+        try:
+            facts = _facts_fut.result()
+        finally:
+            _facts_exec.shutdown()
         # 供 dofile_generator.sanitize_clock_ports 做「时钟必须是顶层端口」的最终清洗
         task["_facts"] = facts
         if facts.get("ok"):
             print(f"  ✓ 网表事实（{facts['modules']} 模块 / 时序单元 {facts['ff_count']}"
                   f" / 移位链 {len(facts['shift_chains'])} / {facts['elapsed']:.1f}s）")
 
-        # 2.5 结构化理解 —— 为 LLM 生成 dofile 准备输入
-        #
-        # 【定位】本系统是「基于大语言模型的 Scan Insertion 智能体」：最终 dofile
-        # 由 LLM 依据「任务说明书 + 网表事实 + 手册检索(RAG) + 命令白名单」写出
-        # （见 dofile_generator.generate_dofile）。结构化理解只是**输入之一**。
-        #
-        # LLM 理解单次实测 62.9~68.0s，而多数 case 预算仅 150s；若在理解上再花一次
-        # LLM 调用，dftexp_scan 就没时间跑（平台首跑 t1/c2、t1/c3、t1/c6 均因此一次
-        # 工具都没跑起来 = 直接 0 分）。因此按预算二选一：
-        #   · 预算充裕（≥ 阈值，如 case5 特批 4800s）→ LLM 理解，规则抽取兜底补字段；
-        #   · 预算紧张（150s 级）→ 0.00s 规则抽取（字段覆盖一致，不牺牲生成质量）。
-        rule_u = dofile_generator.rule_understanding(task, facts=facts)
-        llm_u = None
-        if llm.available and llm_understanding_affordable(task):
-            llm_u = input_parser.extract_task_understanding(task, llm)
-        understanding = merge_understanding(llm_u, rule_u)
+        # ★ 2026-11-01：理解层逐步加异常边界。
+        #   换全新 case 时最先炸的就是这一层（题面结构与旧 case 不同），而它一旦抛出
+        #   异常，整个 case 连 dofile 都产不出＝0 分。规则抽取/合并/事实压制都只是
+        #   「尽量理解」，任何一步失败都该退化成「理解得更少」，而不是终止。
+        try:
+            rule_u = dofile_generator.rule_understanding(task, facts=facts)
+        except Exception as _re:                                # noqa: BLE001
+            print(f"  ⚠ 规则抽取失败（{type(_re).__name__}: {_re}），改为纯 LLM 理解")
+            rule_u = {}
+        try:
+            understanding = merge_understanding(llm_u, rule_u)
+        except Exception as _me:                                # noqa: BLE001
+            print(f"  ⚠ 理解合并失败（{type(_me).__name__}: {_me}），采用 LLM 原样结果")
+            understanding = dict(llm_u or {})
         # 用网表事实压过 task_spec 的措辞（顶层名 / 不存在的端口），
         # 见 apply_facts_precedence 的说明（case6 顶层名、case1/case2 故障端口）。
-        understanding, _fp_notes = apply_facts_precedence(understanding, facts)
+        try:
+            understanding, _fp_notes = apply_facts_precedence(understanding, facts)
+        except Exception as _fe:                                # noqa: BLE001
+            print(f"  ⚠ 事实压制失败（{type(_fe).__name__}: {_fe}），跳过该步")
+            _fp_notes = []
         for _n in _fp_notes:
             print(f"  ⚠ 事实优先：{_n}")
-        print("  ✓ 结构化理解（LLM 抽取 + 规则兜底）" if llm_u
-              else "  ✓ 结构化抽取（规则，0.0s；预算不足以再花一次 LLM 调用）")
+        if llm_u:
+            print(f"  ✓ 结构化理解（LLM 抽取，{'开思考' if _u_think else '快档'}）")
+        else:
+            # 措辞要区分两种原因：真的没时间，还是 LLM 根本不可用。
+            # 2026-11-02 一批测试预算还剩 1074s，却打印「窗口不足以塞下」，
+            # 真实原因是镜像里没装 openai —— 日志把人往错误方向带。
+            _lr = config.llm_block_reason()
+            print("  ✓ 结构化抽取（规则兜底；" +
+                  ("LLM 不可用：" + _lr if _lr else "窗口不足以塞下一次 LLM 调用") + "）")
+
+        # 2.9 分区归属（仅当任务书给了分区表）：把顶层实例划到各功能分区。
+        #     任务书只给「分区名 + 链数 + 功能区域描述」，实例名只在网表里，
+        #     这一步交给 LLM 做语义对应（实测 case2：7 个分区、30 个实例，
+        #     耗时 ~4.5s，链数与使能全对，28/30 实例归属正确）。
+        if llm.available and has_useful_time(llm):
+            try:
+                for _n in dofile_generator.assign_partitions(task, understanding, facts, llm):
+                    print(f"  · 分区：{_n}")
+            except Exception as _pe:                            # noqa: BLE001
+                # 分区只是「加分项」：解析崩了不能把整个 case 拖成 0 分。
+                # 2026-11-01 第五轮新 case 实测：分区表里有一行时钟列是空占位，
+                # 下游 `p["clocks"]` 抛 KeyError，预运行阶段直接终止、连 dofile 都没出。
+                # 这里降级为「不分区」，主流程继续（链数会退到全局配置，但产物齐全）。
+                print(f"  ⚠ 分区归属失败（{type(_pe).__name__}: {_pe}），退化为不分区继续")
+                understanding["partitions"] = []
 
         # 3. 生成 dofile（规则模板 + LLM 候选择优）
         #    这次 LLM 调用是预运行阶段的核心价值，给足时间；真超时才用规则模板。
-        dofile = dofile_generator.generate_dofile(task, understanding, llm, facts=facts)
-        print(f"  ✓ Dofile 生成（{len(dofile)} 字符）")
+        #    ★ 2026-11-01：生成整段加兜底 —— 生成链路任何异常都退到
+        #      「最小可用 dofile」（加载→DRC→插链→导出产物），保证 case 仍有分数。
+        try:
+            dofile = dofile_generator.generate_dofile(task, understanding, llm, facts=facts)
+            print(f"  ✓ Dofile 生成（{len(dofile)} 字符）")
+        except Exception as _ge:                                # noqa: BLE001
+            print(f"  ⚠ Dofile 生成失败（{type(_ge).__name__}: {_ge}）"
+                  f"→ 退回最小可用模板")
+            try:
+                dofile = dofile_generator.minimal_dofile(task, facts)
+            except Exception as _ge2:                           # noqa: BLE001
+                print(f"  ✗ 最小模板也失败（{type(_ge2).__name__}: {_ge2}）")
+                raise
 
         # 3.5 强制校验 dofile 完整性（补齐缺失命令/报告，P0-1）
-        dofile = ensure_dofile_integrity(dofile, task, understanding)
+        try:
+            dofile = ensure_dofile_integrity(dofile, task, understanding)
+        except Exception as _ie:                                # noqa: BLE001
+            print(f"  ⚠ 完整性校验失败（{type(_ie).__name__}: {_ie}），保留当前 dofile")
     finally:
         restore()
         # 预运行阶段结束后，LLM 只受「本 case 内部截止时间」约束（用于多轮修复阶段）
@@ -898,8 +1176,14 @@ def _run_task1_impl(input_dir, output_dir, llm):
     max_runs = max_runs_for(task)
     seen_error_sigs = {}  # 错误签名 -> 首次出现的轮次，用于检测修复是否收敛
     best_errors = None    # 历史最小错误数，用于检测「修复在恶化」（见收敛控制 2）
-    # 内部时钟档位修复已尝试的次数（见 dofile_generator.repair_internal_clocks_for_drc）
-    clock_repair_attempts = 0
+    # DRC 未清零时「交给 LLM 诊断修复」已用掉的次数（上限 2，见循环内同名注释）
+    drc_llm_repairs = 0
+
+    # 工具轮的成本感知：大网表单轮可达 350~400s（case5 实测 370s），
+    # 若违例规模不变还继续重试，5 轮就是 2000s —— 所以每轮记下
+    # 「上一轮违例数」与「本轮耗时」，用于止损。
+    _prev_violations = None
+    _last_run_cost = 0.0
 
     for run_id in range(1, max_runs + 1):
         # 预算用尽就不再开新一轮：超时 = 当前 case 0 分（docx 5.4.1）
@@ -912,7 +1196,8 @@ def _run_task1_impl(input_dir, output_dir, llm):
         print(f"  [Run {run_id}] 运行 dftexp_scan...（超时 {timeout}s）")
         _t_run = time.time()
         result = tool_runner.run_dofile(dofile, run_dir, run_id, timeout=timeout)
-        print(f"  ⏱ Run {run_id} 工具耗时 {time.time() - _t_run:.1f}s"
+        _last_run_cost = time.time() - _t_run
+        print(f"  ⏱ Run {run_id} 工具耗时 {_last_run_cost:.1f}s"
               f"（剩余预算 {remaining_budget(task) or 0:.1f}s）")
         run_results.append(result)
 
@@ -1007,24 +1292,64 @@ def _run_task1_impl(input_dir, output_dir, llm):
                     "resolved": False,
                 })
                 if run_id < max_runs and not time_is_up(task):
-                    # 注意：这里**不能**用 has_useful_time(llm) 当门槛。
-                    # 旧实现加了这个条件，而它在「LLM 不可用」时返回 False ——
-                    # 于是平台实测（本次未注入 LLM_API_KEY）task_1/case5 首轮
-                    # 69k 条 DFTR1 之后直接 break，一次确定性修复都没试。
-                    # 下面两条修复都是纯确定性的，只该受时间预算约束。
-                    clock_repair_attempts += 1
-                    clk_fixed = dofile_generator.repair_internal_clocks_for_drc(
-                        dofile, parsed, attempt=clock_repair_attempts)
-                    if clk_fixed and clk_fixed != dofile:
-                        dofile = clk_fixed
-                        print("  ↻ 已调整内部时钟识别档位，重试")
-                        continue
+                    # 曾经在这里按 DRC 反馈调 `-internal_clocks` 档位
+                    # （none → multi → 追加 -mix_internal_clocks true）。
+                    # 平台实测（task_1/case5）**两次调整都毫无效果**：
+                    # 三档跑出来都是 `DFTR1×69022`，一分不差，却白烧了 ~700s
+                    # （每轮工具 350s）。真正的根因是 pseudo PI 的 clock 声明被
+                    # 判「非端口」删光了，见 dofile_generator.sanitize_clock_ports。
+                    # 因此这里回到确定性补齐；不做无效的档位试探。
+                    # 成本止损：单轮很贵且违例没实质下降时，重试只是把预算换成时间。
+                    # 判据见 retry_not_worthwhile()（只看预算与进展，与流程类型无关）。
+                    _violations = int(parsed.get("total_violations") or 0)
+                    if retry_not_worthwhile(task, _last_run_cost, _violations,
+                                            _prev_violations):
+                        print(f"  ⏹ 单轮已耗 {_last_run_cost:.0f}s 且违例未实质下降"
+                              f"（{_prev_violations} → {_violations}），停止重试")
+                        break
+                    _prev_violations = _violations
 
                     repaired = ensure_dofile_integrity(dofile, task, understanding)
                     if repaired and repaired != dofile:
                         dofile = repaired
                         print("  ↻ 已补齐 DFT 配置，重试")
                         continue
+
+                    # 确定性补齐给不出改动时，**交给 LLM 诊断并修**。
+                    #
+                    # 为什么必须有这一步（泛化）：
+                    #   新 case 的 DRC 根因不可预知（不同规则号、不同时钟/门控结构），
+                    #   写死的补齐规则只覆盖「已知的几类」。旧实现在这里直接 break，
+                    #   等于「规则没命中就放弃」—— 与「让大模型读输入、自己判断并修复」
+                    #   的定位相悖。有 LLM 且预算够时，应当让它基于 DRC 原文与 dofile
+                    #   现况给出修改方案；只有它也失败才收工。
+                    # 上限 2 次：避免在同一个根因上反复烧 LLM 时间。
+                    if (drc_llm_repairs < 2 and llm.available
+                            and has_useful_time(llm) and run_id < max_runs):
+                        drc_llm_repairs += 1
+                        print(f"  ↻ 确定性补齐无改动，交由 LLM 依据 DRC 诊断修复"
+                              f"（第 {drc_llm_repairs}/2 次）")
+                        llm_fixed = dofile_fixer.targeted_fix(
+                            task, dofile, parsed, llm, diagnosis=None)
+                        if llm_fixed:
+                            llm_fixed, _notes = dofile_generator.normalize_dofile_commands(
+                                task, llm_fixed)
+                            llm_fixed = _task2_sanitize(
+                                task, understanding, llm_fixed)
+                        if llm_fixed and llm_fixed != dofile:
+                            dofile = llm_fixed
+                            fix_records.append({
+                                "run": f"R{run_id}",
+                                "issue": "DRC 未清零，确定性补齐无改动",
+                                "root_cause": "DRC 根因未被既有规则覆盖，由 LLM 依据违例原文判断",
+                                "fix": "LLM 按 DRC 原文修改 dofile（改动见 diffs/）",
+                                "found_run": f"R{run_id}",
+                                "applied_run": f"R{run_id + 1}",
+                                "resolved": False,
+                            })
+                            print("  ↻ LLM 已给出修复，重试")
+                            continue
+                        print("  ⚠ LLM 未给出可用修复")
                 break
 
             # 引擎级环境失败（SCAN-0620：ScanInsertion 读不到 license 环境变量）：
@@ -1093,7 +1418,7 @@ def _run_task1_impl(input_dir, output_dir, llm):
                     fixed, norm_notes = dofile_generator.normalize_dofile_commands(task, fixed)
                     for n in norm_notes:
                         print(f"      ⚠ {n}")
-                    fixed = normalize_dofile_layout(task, understanding, fixed, is_task2=False)
+                    fixed = _task2_sanitize(task, understanding, fixed)
                 if fixed and fixed != dofile:
                     fix_records.append({
                         "run": f"R{run_id}",
@@ -1469,6 +1794,11 @@ def _run_task2_impl(input_dir, output_dir, llm):
     rule_issues = order_issues + spec_issues + art_issues
     identified = (task2_diagnoser.merge_issues(llm_issues, rule_issues, base_dofile)
                   if llm_issues else rule_issues)
+    # 丢掉「把官方惯例的 DRC 豁免当故障」的误判：题面禁的是对 DFTR1/DFTR9 豁免，
+    # 而 ECO 引入常量单元后必然报 DFTR-TIE1/TIE0，官方 golden 本身就豁免它们。
+    # 这类误判会让决策记录写"已删除该行"，产物里却必须保留（测试19/20 t2/c6）。
+    identified = task2_diagnoser.drop_benign_drc_waiver_issues(
+        identified, task.get("task_spec", ""), original_dofile)
     for it in identified:
         fix_records.append(_issue_to_record(
             it, original_snapshot, original_text=original_dofile))
@@ -1702,13 +2032,77 @@ def _run_task2_impl(input_dir, output_dir, llm):
         if best_errors is None or n_errors < best_errors:
             best_errors = n_errors
 
-        # ① 确定性 ECO（首选）：根因在网表结构上时，用工具自带的网表编辑命令
-        #    直接把修法落进 dofile —— 改动面只有一个连接 + 一个 MUX，可解释、
-        #    可 LEC、也不依赖 LLM 誊写整份网表。
+        # ① 配置层确定性阶梯（**先于**网表 ECO）。
+        #
+        # 顺序的依据：改动面越小越先试 —— 改一行选项 < 补一条声明 < 动物理网表。
+        # 而且这两个阶梯以前是"写了但没接线"的死代码（repair_internal_clocks_for_drc
+        # 定义了从未被调用），2026-10-30 新 case 里「复位不可控 1810 条」「DFTR1 上万条」
+        # 都没走到它们，直接进了 ECO。
+        # spec 明确说缺陷在网表时不插队（task2/case6 那种，ECO 才是正解）。
+        if not dofile_generator._needs_netlist_eco(task.get("task_spec", "")):
+            cfg_fixed = dofile_generator.repair_missing_assoc_for_drc(
+                current_dofile, parsed, facts)
+            if not cfg_fixed:
+                cfg_fixed = dofile_generator.repair_internal_clocks_for_drc(
+                    current_dofile, parsed, attempt=dofile_fix_attempts + 1)
+            if not cfg_fixed:
+                cfg_fixed = dofile_generator.repair_missing_reset_for_drc(
+                    current_dofile, parsed, task, facts)
+            if cfg_fixed:
+                dofile_fix_attempts += 1
+                current_dofile = dofile_generator.normalize_dofile_commands(
+                    task, cfg_fixed)[0]
+                print("  ↻ 已按 DRC 反馈做配置层修复，重试")
+                fix_records.append({
+                    "run": f"R{run_id}",
+                    "issue": "DRC 反馈指向配置层（内部时钟域未识别 / 复位未声明）",
+                    "root_cause": "set_scan_cfg 的 internal_clocks 档位不足，"
+                                  "或整份 dofile 没有 reset 声明",
+                    "fix": "按 DRC 规则号做确定性配置修复（internal_clocks 升档 / 补 reset 声明）",
+                    "found_run": f"R{run_id}",
+                    "applied_run": f"R{run_id + 1}" if run_id < max_runs else "",
+                    "resolved": False,
+                })
+                continue
+
+        # ② 确定性 ECO（根因在网表结构上时）
         eco_dofile, eco_info = _eco_inject(
             task, current_dofile, parsed, understanding, facts, eco_tried,
-            dofile_fix_attempts=dofile_fix_attempts)
+            dofile_fix_attempts=dofile_fix_attempts, llm=llm)
         if eco_dofile:
+            # ★ ECO 改的是 pre-scan 网表 → 必须先过等价性检查（官方答疑口径：
+            #   「任务二修改了 pre-scan 网表，才需要做等价检查」）。
+            #   旧实现只有 apply_netlist_fix（LLM 整篇重写网表）那条路有 LEC，
+            #   ECO 路径全程没有等价性产物 —— t2/c6 的 decision_log 因此写着
+            #   「未单独运行 LEC」，踩在 5.4.1-3 的零分红线上。
+            if eco_info.get("mode_port_added"):
+                # 新建了测试模式端口：探针网表与原网表的端口集不同，
+                # equiv_make 会把这个新输入当自由变量，结论没有意义。
+                print("  · LEC：本次 ECO 新建了测试模式端口，跳过等价性探针"
+                      "（端口集不同，形式化比对无意义）")
+                lec_info = None
+            else:
+                _rem = remaining_budget(task)
+                _probe_to = None if _rem is None else max(45, min(300, _rem - 45))
+                lec_info = lec_verifier.verify_eco_equivalence(
+                    task, eco_dofile, output_dir, run_id=run_id,
+                    timeout=_probe_to, mode_port=eco_info.get("mode_port") or "",
+                    log=print)
+            if lec_info and lec_info.get("applied") is False:
+                print("  ✗ ECO 未通过等价性检查，回滚本次网表修改（正式 dofile 不变）")
+                fix_records.append({
+                    "run": f"R{run_id}",
+                    "issue": "ECO 修复后的 pre-scan 网表未通过逻辑等价性检查",
+                    "root_cause": "ECO 插入的 MUX 改变了功能路径（A0 未保持原连接）",
+                    "fix": "丢弃本次 ECO，正式 dofile 不包含该次网表修改",
+                    "found_run": f"R{run_id}",
+                    "applied_run": "",
+                    "resolved": False,
+                    "lec": lec_info.get("lec"),
+                })
+                continue
+            if lec_info:
+                netlist_changes.append(lec_info)
             current_dofile = eco_dofile
             print(f"  ↻ 已按网表结构推导 ECO 修复（{len(eco_info['groups'])} 处："
                   + "、".join(f"{g['kind']}@{g['module']}" for g in eco_info["groups"])
@@ -1725,6 +2119,7 @@ def _run_task2_impl(input_dir, output_dir, llm):
                 "applied_run": f"R{run_id + 1}" if run_id < max_runs else "",
                 "resolved": False,
                 "eco": eco_info,
+                "lec": (lec_info or {}).get("lec"),
             })
             continue
 
@@ -1768,6 +2163,7 @@ def _run_task2_impl(input_dir, output_dir, llm):
             netlist_change = _try_netlist_fix(
                 task, netlist_files, diagnosis, parsed, current_dofile,
                 output_dir, llm, run_id=run_id,
+                urgent=(run_id >= max_runs - 1),
             )
             if netlist_change:
                 netlist_changes.append(netlist_change)
@@ -1796,6 +2192,31 @@ def _run_task2_impl(input_dir, output_dir, llm):
         if nc.get("applied"):
             applied_change = nc
             break
+
+    # ── 等价性兜底（2026-11-01）────────────────────────────────────────
+    # 探针没拿到网表（工具抖动 / dump 失败）时，正式 dofile 里的
+    # `dump_netlist ... netlist_fixed.v` 仍然会产出一份「ECO 已做、链未插」的
+    # 网表。口径是「改过 pre-scan 网表就必须有等价性产物」（5.4.1-3 零分红线），
+    # 所以这里用它补一次 LEC，而不是留空。
+    if applied_change is None:
+        _ftext = _dofile_text_of_run(final_run) or ""
+        if re.search(r"^[ \t]*(?:disconnect_net|connect_net|add_inst)\b",
+                     _ftext, re.M):
+            _art = lec_verifier.find_pre_scan_artifact(
+                final_run.get("run_dir"), output_dir)
+            if _art:
+                # 兜底时没有 eco_info，从 dofile 的 ECO 块反推测试模式端口
+                # （`connect_pin -from <mode> -to <mux>/S` 的 S 端就是它）
+                _m = re.search(r"connect_pin\s+-from\s+(\S+)\s+-to\s+\S+/S\b",
+                               _ftext)
+                _fc = lec_verifier.verify_final_netlist_artifact(
+                    task, _art, output_dir,
+                    run_id=final_run.get("run_id") or "R1",
+                    mode_port=(_m.group(1) if _m else ""),
+                    dofile_text=_ftext)
+                if _fc:
+                    netlist_changes.append(_fc)
+                    applied_change = _fc
 
     output_manager.finalize_outputs(output_dir, final_run, task,
                                     netlist_change=applied_change)
@@ -1918,7 +2339,7 @@ def _analyze_netlist_for_task2(task):
 
 
 def _eco_inject(task, current_dofile, parsed, understanding, facts, tried,
-                dofile_fix_attempts=0):
+                dofile_fix_attempts=0, llm=None, urgent=False):
     """
     确定性网表 ECO：把 ECO 命令插进 dofile（在 present_design 之后、DFT 配置之前）。
 
@@ -1937,7 +2358,13 @@ def _eco_inject(task, current_dofile, parsed, understanding, facts, tried,
         (新 dofile 文本, 说明 dict) —— 无可用 ECO 时返回 (None, None)
     """
     key = _violation_rule_key(parsed)
-    if not key or key in tried:
+    if not key:
+        return None, None
+    # 「规则版」与「LLM 版」各只试一次，但要分开记。
+    # 旧实现只按规则签名记一次 —— 规则推出的 ECO 若把目标选错（形态像但根因不是它），
+    # 下一轮 DRC 不降时 key 已 tried，LLM 连一次机会都没有，只能等死。
+    rule_key, llm_key = (key, "rule"), (key, "llm")
+    if rule_key in tried and llm_key in tried:
         return None, None
 
     # 硬门槛：什么时候才允许动网表。
@@ -1958,12 +2385,25 @@ def _eco_inject(task, current_dofile, parsed, understanding, facts, tried,
     #   所以它的 dofile 修复一成功就结束了，根本走不到 ②；而 ② 又排在 ① 之后、
     #   要求先试过 dofile 修复，不会像旧代码那样「首轮失败就抢跑改网表」。
     spec_hint = dofile_generator._needs_netlist_eco(task.get("task_spec", ""))
-    if not spec_hint and dofile_fix_attempts < 1:
-        print("  · 未从 spec 判定为网表缺陷，先尝试 dofile 层修复"
-              "（若无效则自动转入网表 ECO）")
+    # 无 spec 依据时必须**先穷尽配置层**：从 1 次提到 2 次。
+    #
+    # 依据（2026-10-30 新 case 复盘）：两个「纯 dofile 配置修复」的 case 被我们
+    # 插了网表 ECO（断时钟网 / 插 MUX / 重连），而真实根因是 scan_enable 没覆盖
+    # ICG（DFTR9）—— 改 `-usage` 就能消。当时的门槛是「dofile 修过一次还没好」，
+    # 而我们的第一次修复可能只改了一半（比如只调了时钟声明没动 usage），于是
+    # 判成"改配置消不掉"，转头去动物理网表：既改坏了网表，又白烧两轮工具时间。
+    #
+    # 两次而不是无限次：配置层的确定性阶梯（DFTR1 → internal_clocks → 时钟声明；
+    # DFTR9 → usage all）本身也就两三级，两次之后仍不降，才说明根因大概率真在结构上。
+    # `urgent=True`（已到最后一轮）：门槛从 2 次降到 1 次。
+    # 新 case 最容易卡死在这里：配置层连修两轮仍不降、但轮次已经用完，网表 ECO
+    # 一次都没试过 —— 结果 DRC 一直挂着。最后一轮把机会给结构修复更划算
+    # （配置层已经证明无效，再重复一次只会更差）。
+    _min_attempts = 1 if urgent else 2
+    if not spec_hint and dofile_fix_attempts < _min_attempts:
+        print("  · 未从 spec 判定为网表缺陷，先穷尽 dofile 层修复"
+              f"（已试 {dofile_fix_attempts} 次，需 {_min_attempts} 次后才允许动网表）")
         return None, None
-
-    tried.add(key)
 
     netlists = task.get("files", {}).get("netlist", [])
     if not netlists:
@@ -1989,44 +2429,135 @@ def _eco_inject(task, current_dofile, parsed, understanding, facts, tried,
     except Exception:
         pass
 
-    # 测试模式端口：网表已声明但无负载的那个（case6 的 scan_mode）
-    #
-    # 旧实现只做「无负载端口名出现在 spec 文本里」的匹配 —— 隐藏 case 若没在
-    # spec 里点名该端口，mode_port 就是空串，derive_netlist_eco 直接 return None，
-    # 整条 ECO 链路静默失效（表现为「DRC 一直在、修不降」）。所以补两级兜底：
-    #   ① spec 点名（最可信）；
-    #   ② 名字像测试模式（scan_mode / test_mode / scan_en / se / tm …）的无负载端口。
-    mode_port = ""
-    unloaded = (facts or {}).get("unloaded_ports") or []
-    spec = task.get("task_spec", "") or ""
-    for p in unloaded:
-        if re.search(r"\b%s\b" % re.escape(p), spec):
-            mode_port = p
-            break
-    if not mode_port and unloaded:
-        _mode_name_re = re.compile(
-            r"(scan_?mode|scan_?en|test_?mode|test_?en|^se$|^tm$|^scan$|"
-            r"mode_?sel|dft)", re.I)
-        mode_port = next((p for p in unloaded if _mode_name_re.search(p)), "")
+    # 测试模式端口：MUX 的 S 端。**必须**是模式/使能类端口，绝不能是复位或时钟。
+    mode_port, need_add_port = _pick_mode_port(task, understanding, facts)
     # 扫描时钟端口
     clocks = [c.get("port") for c in (understanding or {}).get("clock_signals") or []
               if c.get("role", "scan_clock") != "described_only"]
     clock_port = clocks[0] if clocks else ""
 
-    eco = lec_verifier.derive_netlist_eco(
-        {"scan_clock_port": clock_port},
-        target[1], lib_meta, parsed, mode_port=mode_port)
-    if not eco:
+    if not mode_port:
+        # 没有可信的 S 端来源就不动网表：接错端口的 ECO 比不修更糟
+        # （测试态 S 恒为 0，MUX 永远选功能路径，DRC 一点都不会降）。
+        print("  · 未找到可信的测试模式端口，跳过网表 ECO（避免把 S 端接到复位/时钟）")
         return None, None
 
-    new_dofile = _insert_eco_block(current_dofile, eco["lines"])
+    eco = None
+    if rule_key not in tried:
+        eco = lec_verifier.derive_netlist_eco(
+            {"scan_clock_port": clock_port},
+            target[1], lib_meta, parsed, mode_port=mode_port)
+        if eco:
+            tried.add(rule_key)
+
+    if not eco:
+        # 形态库没命中 —— 比赛给的是新 case，缺陷形态可以不重样（穿两级门、
+        # OR 门控、ICG 的 CP 端被常量钳住……）。漏一个的表现是「DRC 一直在、
+        # 怎么补配置都不降」，而且不报错。这一步把候选点摊平交给 LLM 选，
+        # 但动作空间受约束（target 必须来自候选清单、S 必须是测试模式端口、
+        # A1 只能端口或 TIE1），见 llm_eco 模块说明。
+        ports = sorted((facts or {}).get("top_ports") or {})
+        if (llm_key not in tried and llm is not None
+                and getattr(llm, "available", False) and ports):
+            print("  · 确定性 ECO 未命中/未生效，交由 LLM 在候选点中判定")
+            eco = llm_eco.plan_eco(task, target[1], lib_meta, parsed, mode_port,
+                                   clock_port, ports, llm, top=top)
+            if eco:
+                tried.add(llm_key)
+        if not eco:
+            return None, None
+
+    eco_lines = list(eco["lines"])
+    if need_add_port:
+        # 任务书要求的测试模式端口在网表里根本不存在：必须先建端口，
+        # 否则 connect_pin -from <port> 直接 SCAN-1315（端口不存在）。
+        eco_lines.insert(0, f"add_port {{{mode_port}}} -direction in")
+        eco_lines.insert(1, f"# 测试模式端口 {mode_port} 由任务书要求新建（网表中不存在）")
+
+    new_dofile = _insert_eco_block(current_dofile, eco_lines)
     if not new_dofile:
         return None, None
     # clock_port 用「实际采用值」：spec 没写时是网表反推出来的那个，
     # 决策日志要能复现「A1 到底接到了哪个端口」。
     return new_dofile, {"mode_port": mode_port,
                         "clock_port": eco.get("clock_port") or clock_port,
+                        "mode_port_added": bool(need_add_port),
                         "groups": eco["groups"], "netlist": str(target[0])}
+
+
+# 名字像「测试模式/扫描使能」的端口 —— MUX 的 S 端候选。
+_MODE_NAME_RE = re.compile(
+    r"(scan_?mode|test_?mode|dft_?mode|mode_?sel|scan_?en|test_?en|"
+    r"(?:^|_)se$|^se_|^tm$|^scan$|^dft$)", re.I)
+# 一眼就是复位/时钟的名字 —— 无论 spec 怎么提都不能当 S 端。
+_NOT_MODE_NAME_RE = re.compile(
+    r"(?:^|_)(rst|reset|nrst|rstn|clk|clock|gclk)(?:_|$)", re.I)
+# 同一句里出现这些词，才允许把「名字不像模式端口」的无负载端口当 S 端。
+_MODE_SENT_RE = re.compile(
+    r"测试模式|扫描模式|scan\s*_?mode|test\s*_?mode|DFT\s*模式", re.I)
+
+
+def _pick_mode_port(task, understanding, facts):
+    """
+    选 ECO 里 MUX 的 S 端（测试模式端口）。返回 (port, need_add_port)。
+
+    为什么单独抽出来（2026-10-29，泛化缺陷）：
+      旧实现是「遍历**所有**无负载端口，谁在 spec 里出现过就用谁」。
+      `unloaded_ports` 是 sorted 的，`rst_n` 排在 `scan_mode` 前面，而复位几乎
+      必然在 task_spec 里出现 —— 于是 S 端被接到复位上：测试态 S=0，ECO 的
+      MUX 永远选功能路径，时钟照样断开（DFTR1 一点不降），还多出一个把复位当
+      模式信号的语义错误。这份缺陷在任何「复位无负载 + 有模式端口」的新 case 上
+      都会复现，不是某个 case 的特例。
+
+    现在的顺序（每一级都先排除复位/时钟）：
+      ① 无负载 + 名字像模式/使能（最可信：case6 的 scan_mode 就落在这里）；
+      ② 无负载 + 同句被描述成测试模式（spec 写「`xxx` 为测试模式输入」）；
+      ③ 顶层已存在 + 名字像模式（端口已接了别的负载，仍可作为 S 端）；
+      ④ 任务书要求新建、网表里没有 → need_add_port=True，先 add_port 再用。
+    """
+    spec = (task or {}).get("task_spec", "") or ""
+    facts = facts or {}
+    u = understanding or {}
+    top_ports = facts.get("top_ports") or {}
+    unloaded = [p for p in (facts.get("unloaded_ports") or [])
+                if not top_ports or p in top_ports]
+
+    banned = set()
+    for key in ("clock_signals", "reset_signals"):
+        for s in u.get(key) or []:
+            p = str((s or {}).get("port") or "").strip()
+            if p:
+                banned.add(p)
+    banned |= set((facts.get("clock_ports") or {}).keys())
+    banned |= set((facts.get("reset_ports") or {}).keys())
+
+    def _ok(p):
+        return bool(p) and p not in banned and not _NOT_MODE_NAME_RE.search(p)
+
+    # ① 无负载 + 名字像模式
+    cand = [p for p in unloaded if _ok(p) and _MODE_NAME_RE.search(p)]
+    if cand:
+        return sorted(cand, key=len)[0], False
+    # ② 无负载 + 同句被描述成测试模式
+    sents = [s for s in re.split(r"[。；;\n]", spec) if s.strip()]
+    for p in sorted(unloaded, key=len):
+        if not _ok(p):
+            continue
+        if any(p in s and _MODE_SENT_RE.search(s) for s in sents):
+            return p, False
+    # ③ 顶层端口里名字像模式（可能已有负载）
+    cand = [p for p in top_ports if _ok(p) and _MODE_NAME_RE.search(p)]
+    if cand:
+        return sorted(cand, key=len)[0], False
+    # ④ 任务书要求新建：常量/扫描使能里点名、网表里没有该端口
+    for key in ("constant_signals", "scan_enable_signals"):
+        for s in u.get(key) or []:
+            p = str((s or {}).get("port") or "").strip()
+            if not p or p in top_ports or p in banned:
+                continue
+            if _MODE_NAME_RE.search(p):
+                return p, True
+    return "", False
 
 
 def _insert_eco_block(dofile_text, eco_lines):
@@ -2044,7 +2575,7 @@ def _insert_eco_block(dofile_text, eco_lines):
     if idx is None:
         return None
     block = ["", "# ── 网表 ECO 修复（确定性推导，A0=原逻辑 / A1=测试逻辑 / S=测试模式）──"]
-    block += [f"    {l}" if False else l for l in eco_lines]
+    block += list(eco_lines)
     return "\n".join(lines[:idx + 1] + block + lines[idx + 1:]) + "\n"
 
 
@@ -2052,7 +2583,13 @@ def _violation_rule_key(parsed):
     """本轮 DRC 里「根因在网表」的规则签名（用于只尝试一次）。"""
     rules = lec_verifier._violation_rules(parsed)
     hit = sorted(rules & lec_verifier._NETLIST_ROOT_DRC_RULES)
-    return "|".join(hit) if hit else ""
+    if hit:
+        return "|".join(hit)
+    # 兜底：一条"明确网表根因"的规则都没命中时，仍然给一个稳定 key。
+    # 否则会提前 return，ECO 分支根本不会被考虑 —— 表现就是"怎么修都不降"。
+    # 是否会真的动网表由下游硬门槛把关（要先试过一次 dofile 修复 / spec 明确提示），
+    # 所以这里放宽不会变成"首轮就抢跑改网表"。
+    return ("RESIDUAL:" + "|".join(sorted(rules))) if rules else ""
 
 
 def _try_netlist_fix(task, netlist_files, diagnosis, parsed, current_dofile,
@@ -2232,6 +2769,13 @@ def _parsed_from_result(result):
         drc = report_parser.collect_drc(run_dir=result.get("run_dir"), parsed=parsed)
         if drc.get("rules"):
             parsed["drc_rules"] = drc["rules"]
+        if drc.get("warning_rules"):
+            # 明细行标为 [WARNING] 的规则（官方允许保留的 DFTR10 等），
+            # 供 drc_effective 区分「告警残留」与「必须清零的违例」。
+            parsed["drc_warning_rules"] = drc["warning_rules"]
+        if drc.get("error_rules"):
+            # 出现过 [ERROR] 明细的规则永不算「允许残留」。
+            parsed["drc_error_rules"] = drc["error_rules"]
         parsed["total_violations"] = max(int(parsed.get("total_violations") or 0),
                                          int(drc.get("total_violations") or 0))
         parsed["drc_sources"] = drc.get("sources") or []
@@ -2482,31 +3026,88 @@ def wait_for_case_ready(input_dir):
         has_case = False
 
     try:
-        grace = float(os.environ.get("SCAN_AGENT_READY_GRACE", "5"))
+        grace = float(os.environ.get("SCAN_AGENT_READY_GRACE", "1.5"))
     except ValueError:
-        grace = 5.0
+        grace = 1.5
+    try:
+        settle = float(os.environ.get("SCAN_AGENT_READY_SETTLE", "1.5"))
+    except ValueError:
+        settle = 1.5
+    try:
+        max_wait = float(os.environ.get("SCAN_AGENT_READY_MAX_WAIT", "180"))
+    except ValueError:
+        max_wait = 180.0
 
     t0 = time.time()
-    deadline = (t0 + grace) if has_case else None
     if has_case:
-        print(f"  ⏱ 未见就绪标志（本地直跑？），宽限 {grace:g}s 后继续")
+        print(f"  ⏱ 未见就绪标志：等待 input 稳定后继续"
+              f"（最短 {grace:g}s、静止 {settle:g}s 判定，上限 {max_wait:g}s）")
     else:
         print(f"  ⏱ 等待就绪标志 {sentinel}（评测 t1 自其落盘起算）...")
 
+    def _sig():
+        """
+        input 目录的轻量指纹：文件数 + 总字节 + 最新 mtime（**递归**）。
+
+        必须递归：input 的真实载荷在子目录里（netlist/、lib/），只统计顶层的话，
+        网表正在拷贝时顶层毫无变化，会被误判成「已稳定」。
+        入口上限 50000 个文件，超过就不再精算（此时也早就稳定了）。
+        """
+        n = total = 0
+        newest = 0.0
+        try:
+            for root, _dirs, files in os.walk(input_dir):
+                for fn in files:
+                    n += 1
+                    try:
+                        st = os.stat(os.path.join(root, fn))
+                        total += st.st_size
+                        if st.st_mtime > newest:
+                            newest = st.st_mtime
+                    except OSError:
+                        pass
+                    if n >= 50000:
+                        return (n, total, round(newest, 3))
+        except OSError:
+            return (n, total, round(newest, 3))
+        return (n, total, round(newest, 3))
+
+    last_sig = None
+    last_change = t0
     next_beat = 5.0
     while True:
         hit = next((p for p in (os.path.join(input_dir, n) for n in READY_SENTINELS)
                     if os.path.exists(p)), None)
         if hit:
             break
-        waited = time.time() - t0
-        if deadline is not None and time.time() >= deadline:
-            print("  ⏱ 宽限期结束，按本地模式继续")
-            return waited
-        if deadline is None and waited >= next_beat:
-            print(f"  ⏱ 仍在等待就绪标志（已 {waited:.0f}s）")
-            next_beat = waited + 5.0
-        time.sleep(0.05)
+
+        now = time.time()
+        waived = now - t0
+        cur = _sig()
+        if cur != last_sig:
+            last_sig = cur
+            last_change = now
+        quiet = now - last_change
+
+        # 判定「可以开工」：有文件、已过最短等待、且目录**静止**了 settle 秒。
+        # 为什么不再用固定的「宽限 5s 就冲」：
+        #   评测挂载是宿主机目录，大 case（case5 网表 232MB）拷贝需要时间。
+        #   旧逻辑只要目录里有 1 个文件，5s 后无条件开工 —— 可能读到「task_spec
+        #   已到位、网表只拷了一半」的输入，解析出错却毫无提示。
+        #   现在以「目录不再变化」为准，既不会读半截，也不会白等固定 5s。
+        if has_case and waived >= grace and quiet >= settle:
+            print(f"  ⏱ input 已稳定（{cur[0]} 个文件 / {cur[1]/1048576:.1f}MB，"
+                  f"静止 {quiet:.1f}s），开始处理任务")
+            return waived
+
+        if waived >= max_wait:
+            print(f"  ⚠ 等待 {waived:.0f}s 仍未出现就绪标志，按当前输入继续"
+                  f"（请确认 input 是否完整）")
+            return waived
+        if waived >= next_beat:
+            print(f"  ⏱ 仍在等待就绪标志（已 {waived:.0f}s）")
+            next_beat = waived + 5.0
+        time.sleep(0.25)
 
     waited = time.time() - t0
     print(f"  ⏱ 就绪标志出现（等待 {waited:.2f}s），开始处理任务")
@@ -2530,7 +3131,25 @@ def wait_for_case_ready(input_dir):
 # 核对方式：
 #   grep BUILD_TAG <平台返回的 intermediate_files/*/container.log>
 # 或在容器里直接看启动横幅。
-_BUILD_TAG = os.environ.get("SCAN_AGENT_BUILD", "2026-10-23-r17-refalign")
+_BUILD_TAG = os.environ.get("SCAN_AGENT_BUILD", "2026-11-03-r63-no-decl-delete")
+
+
+def _since_proc_start():
+    """
+    进程起点（agent_system 导出的 SCAN_AGENT_T0）到现在的秒数；取不到返回 None。
+
+    为什么要它：平台上报的 case 耗时从「容器启动」算起，而我们自己的计时表是从
+    「等 input 就绪之后」才起。两者之间那段（解释器启动 + 导入 openai/manual_rag +
+    工具/License 探针 + 等 input 落盘）以前完全不可见 —— 曾有一次 t2/case2
+    平台 113.7s、日志 35.8s，差的 78s 无从归因。
+    """
+    raw = os.environ.get("SCAN_AGENT_T0")
+    if not raw:
+        return None
+    try:
+        return time.time() - float(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def main():
@@ -2543,7 +3162,8 @@ def main():
     print("=" * 60)
     print(f"  Scan Insertion Agent   [build {_BUILD_TAG}]")
     print("=" * 60)
-    print(f"  LLM: {'可用' if config.llm_available() else '不可用(规则兜底)'}")
+    _llm_block = config.llm_block_reason()
+    print(f"  LLM: {'可用' if not _llm_block else '不可用（' + _llm_block + '）'}")
     # SDK 版本：平台构建装到的是 openai 3.37.0（>=1.0.0 放开后由镜像源解析），
     # 参考示例 pin 的是 1.12.0。打印出来，出问题时能立刻判断是不是 SDK 大版本差异。
     _oai = ""
@@ -2552,6 +3172,12 @@ def main():
     except Exception:                                        # noqa: BLE001
         pass
     print(f"       openai SDK {_oai or '(未安装)'}")
+    if _llm_block:
+        # 显式喊出来：否则「跑完了、产物也有」会被当成 LLM 在工作的结果。
+        print(f"  ⚠ LLM 不可用（{_llm_block}）：本次全程走确定性规则路径，"
+              f"LLM 不参与")
+        print("     该结果**不能**代表 LLM 能力；请确认镜像内已安装 openai"
+              "（pip3 install openai）且已注入 LLM_API_KEY")
     if config.llm_available():
         # 只打印「脱敏后的地址 + 模型名」，方便核对归一化结果（base_url 必须以
         # /v1 结尾，否则 OpenAI 兼容客户端会打到 /chat/completions 而 404）。
@@ -2592,8 +3218,16 @@ def main():
 
     llm = get_llm()
 
+    # 启动分段计时：容器启动 -> 探针结束（这一段平台会计入，但我们的主表还没起）
+    _boot = _since_proc_start()
+    if _boot is not None:
+        print(f"  ⏱ 启动到自检完成 {_boot:.1f}s（解释器 + 导入 + 环境探针）")
+
     # 评测计时机制：必须在读取任何输入之前等待哨兵 /input/.case_ready
-    wait_for_case_ready(args.input)
+    _waited = wait_for_case_ready(args.input)
+    if _boot is not None:
+        _tot = _since_proc_start()
+        print(f"  ⏱ 到任务开始共 {_tot:.1f}s（其中等 input {_waited:.1f}s）")
 
     # 预算计时起点：赛题 5.4.1 的 wall time 从「哨兵创建（case 文件落入 /input）
     # → 容器退出」计算，因此必须**在哨兵就绪之后**才起表。若提前到 main() 开头，
@@ -2641,6 +3275,29 @@ def main():
             _scan_elapsed = time.time() - _RUN_STARTED_AT
         except Exception:                                       # noqa: BLE001
             _scan_elapsed = -1.0
+        # 交付断言（规范 84-90 行的交付物清单）：marker 照写（不写=超时），
+        # 但缺什么必须让人一眼看到 —— 否则「0 条链 + 无 DRC 报告」也会被记成
+        # "按时完成"，评审只看 cases_passed 是发现不了的（新 case ex3 首跑）。
+        try:
+            try:
+                _tt = task_type                      # noqa: F821（main 里赋值）
+            except NameError:
+                _tt = "task1"
+            _outp = Path(args.output)
+            _has_nl = any(
+                (_outp / "final_results" / "deliverables" / _n).exists()
+                for _n in ("pre_scan_final.v", "netlist_fixed.v"))
+            _missing = delivery_assertions(
+                args.output, task_type=_tt, has_netlist_change=_has_nl)
+            if _missing:
+                print(f"  ⚠ 交付断言：缺 {len(_missing)} 项产物")
+                for _m in _missing:
+                    print(f"      - {_m}")
+                print(f"  ⚠ 本轮状态记为 incomplete（仍写完成标志，避免被判超时）")
+            else:
+                print("  ✓ 交付断言：产物齐全")
+        except Exception as _exc:                               # noqa: BLE001
+            print(f"  ⚠ 交付断言执行失败（不影响写标志）：{_exc}")
         _write_complete_marker(args.output)
         if _scan_elapsed >= 0:
             print(f"  ⏱ 端到端耗时 {_scan_elapsed:.1f}s，已写完成标志 "

@@ -352,8 +352,189 @@ def _move_tool_outputs(deliverables, tool_out, reports):
 
 
 
+
+# ============================================================================
+# Liberty -> Verilog 功能模型（门级 LEC 的前置条件）
+# ============================================================================
+#
+# 为什么必须有（2026-11-01，测试18 实测）：
+#   `read_liberty` 只给 yosys **黑盒定义**（端口 + 时序），不给逻辑功能。
+#   门级 LEC 一跑到 `equiv_make` 就报
+#       ERROR: Missing function on output GCLK of cell sky130_fd_sc_hd__dlclkp_1
+#   报告 705 字节、结论无效 —— 按规范 5.4.1-3「失败或未完成 = 0 分」等于没交。
+#
+#   而 input 里只有 `.lib`，没有 `sky130_fd_sc_hd.v` 这种仿真模型。
+#   好在 Liberty 自己就带功能信息：实测该库有 `function` 943 处、`direction` 1924 处，
+#   扫描触发器还直接给了 `next_state : "(D&!SCE) | (SCD&SCE)"`。
+#   所以我们自己从 .lib 生成等价的行为模型。
+#
+# 精度取舍：生成的模型只求「**两侧一致**」，不追求与硅片逐周期相同 ——
+#   等价性检查比较的是同一份模型下的两份网表，模型越一致结论越可靠。
+#   唯一必须近似的是 ICG（Liberty 只给 statetable，不给布尔 function），
+#   用 `GCLK = CLK & ~GATE` 表达"时钟高且未门控时通过"。
+
+_LIB_MODEL_CACHE = {}
+
+
+def _balance_block(text, start):
+    """从 start（紧跟 `{`）取到配平的 `}`，返回内部文本。"""
+    depth, i = 1, start
+    while i < len(text) and depth:
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+        i += 1
+    return text[start:i - 1]
+
+
+def _lib_blocks(text, keyword):
+    """按关键字取块（`ff (...) {` / `latch (...) {` 这类）。"""
+    out = []
+    for m in re.finditer(keyword + r"\s*(?:\([^)]*\))?\s*\{", text):
+        out.append(_balance_block(text, m.end()))
+    return out
+
+
+def _lib_attr(block, key):
+    m = re.search(key + r'\s*:\s*"([^"]*)"', block)
+    return m.group(1) if m else ""
+
+
+def _lib_expr(expr):
+    """Liberty 布尔表达式 -> Verilog。
+
+    `!` -> `~`；`+` 在 Liberty 是 OR；`*` 是 AND（state_function 里写 `(CLK*M0)`）。
+    逐位运算符对标量信号与逻辑运算等价，不影响等价性判定。
+    """
+    e = (expr or "").strip()
+    e = e.replace("!", "~").replace("+", "|")
+    if "*" in e:
+        e = e.replace("*", "&")
+    return e
+
+
+def _strip_invert(expr):
+    """`~RST_N` -> `RST_N`（用于取异步复位的敏感沿）。"""
+    e = _lib_expr(expr).strip()
+    while e.startswith("~"):
+        e = e[1:].strip()
+    return e.strip("() ")
+
+
+def _cell_model(name, body):
+    """把一个 Liberty cell 块翻成一个 Verilog 模块（无法建模时返回 ""）。"""
+    pins, seen = [], set()          # [(pin, direction, function)]，按名字去重
+    for m in re.finditer(r'pin\s*\(\s*"?(\w+)"?\s*\)\s*\{', body):
+        pin = m.group(1)
+        if pin in seen:             # 库里同一个 pin 会有重复定义（如 sdfxtp_1），
+            continue                # 不去重会生成 (CLK,D,Q,CLK,D,Q) 这种非法端口表
+        pbody = _balance_block(body, m.end())
+        d = _lib_attr(pbody, "direction")
+        if d not in ("input", "output"):
+            continue
+        seen.add(pin)
+        pins.append((pin, d, _lib_attr(pbody, "function")))
+    ins = [p for p, d, _f in pins if d == "input"]
+    outs = [p for p, d, _f in pins if d == "output"]
+    if not outs:
+        return ""
+
+    head = [f"module {name} ({', '.join(ins + outs)});"]
+    if ins:
+        head.append("  input " + ", ".join(ins) + ";")
+    head.append("  output " + ", ".join(outs) + ";")
+
+    ff = _lib_blocks(body, r"ff")
+    lat = _lib_blocks(body, r"latch")
+    is_icg = "clock_gating_integrated_cell" in body
+    logic = ""
+
+    if is_icg and len(ins) >= 2 and len(outs) == 1:
+        # ICG **降维为纯缓冲**（官方参考链的坑 1，见
+        # 赛题二更正材料1012/task2-case6/yosys/README.md）：
+        #   「ICG(sdlclkp_1) 降维为 assign GCLK = CLK，否则 clk2fflogic 下
+        #     GATE/SCE 反馈成组合环。两侧同用该模型。」
+        # 门控使能的差异在两侧一致地被忽略 —— 那是 DFT 逻辑，不属于功能等价范畴；
+        # 要判 ICG 接法是否正确，另有 A0/A1/S 结构判据。
+        logic = f"  assign {outs[0]} = {ins[0]};"
+    elif ff:
+        blk = ff[0]
+        clk = _lib_expr(_lib_attr(blk, "clocked_on"))
+        nxt = _lib_expr(_lib_attr(blk, "next_state")) or "0"
+        clr = _lib_attr(blk, "clear")
+        pre = _lib_attr(blk, "preset")
+        q = outs[0]
+        if clk:
+            if clr:
+                r = _strip_invert(clr)
+                logic = (f"  always @(posedge {clk} or negedge {r})\n"
+                         f"    if (~{r}) {q} <= 1'b0; else {q} <= {nxt};")
+            elif pre:
+                r = _strip_invert(pre)
+                logic = (f"  always @(posedge {clk} or negedge {r})\n"
+                         f"    if (~{r}) {q} <= 1'b1; else {q} <= {nxt};")
+            else:
+                logic = f"  always @(posedge {clk}) {q} <= {nxt};"
+    elif lat:
+        blk = lat[0]
+        en = _lib_expr(_lib_attr(blk, "enable"))
+        din = _lib_expr(_lib_attr(blk, "data_in")) or "0"
+        if en:
+            logic = f"  always @* if ({en}) {outs[0]} <= {din};"
+    if not logic:
+        # 组合单元：每个 output 的 function 直接写成 assign
+        parts = []
+        for p, d, fn in pins:
+            if d == "output" and fn and fn not in ("0", "1") and "VPWR" not in fn:
+                parts.append(f"  assign {p} = {_lib_expr(fn)};")
+            elif d == "output" and fn in ("0", "1"):
+                parts.append(f"  assign {p} = 1'b{fn};")
+        logic = "\n".join(parts)
+    if not logic:
+        return ""
+    return "\n".join(head) + "\n" + logic + "\nendmodule\n"
+
+
+def liberty_to_verilog(lib_path, out_path=None):
+    """
+    把 Liberty 库转成 Verilog 行为模型，返回 (模型文本, 模块数)。
+
+    同一个 lib 只解析一次（按路径 + mtime 缓存）：12.8MB 的 sky130.lib
+    每轮都重新解析会白白吃掉好几秒。
+    """
+    try:
+        st = Path(lib_path).stat()
+    except OSError:
+        return "", 0
+    key = (str(lib_path), st.st_mtime, st.st_size)
+    if key in _LIB_MODEL_CACHE:
+        text, n = _LIB_MODEL_CACHE[key]
+    else:
+        try:
+            lib = Path(lib_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return "", 0
+        mods, n = [], 0
+        for m in re.finditer(r'cell\s*\(\s*"([^"]+)"\s*\)\s*\{', lib):
+            name = m.group(1)
+            body = _balance_block(lib, m.end())
+            model = _cell_model(name, body)
+            if model:
+                mods.append(model)
+                n += 1
+        text = "\n".join(mods)
+        _LIB_MODEL_CACHE[key] = (text, n)
+    if out_path and text:
+        try:
+            Path(out_path).write_text(text, encoding="utf-8")
+        except OSError:
+            pass
+    return text, n
+
+
 def run_yosys_lec(original_netlist, modified_netlist, run_dir, top_module=None,
-                  lib_files=None):
+                  lib_files=None, model_files=None):
     """
     使用 Yosys 做逻辑等价性检查（LEC），校验改网表后功能是否等价。
 
@@ -383,12 +564,15 @@ def run_yosys_lec(original_netlist, modified_netlist, run_dir, top_module=None,
             "error": str 或 None,      # 错误信息
         }
     """
-    run_dir = Path(run_dir)
+    # 一律解析成绝对路径：subprocess 以 cwd=run_dir 运行，脚本路径若还是相对路径
+    # 就会被拼两遍（`_tmp_test/lec_x/_tmp_test/lec_x/lec.ys`）→ yosys 打不开脚本，
+    # 静默失败成一个 "unknown"，看起来像"工具证明不了"。
+    run_dir = Path(run_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     report_path = run_dir / "lec_report.rpt"
 
-    original_netlist = _quote_path(original_netlist)
-    modified_netlist = _quote_path(modified_netlist)
+    original_netlist = _quote_path(Path(str(original_netlist)).resolve())
+    modified_netlist = _quote_path(Path(str(modified_netlist)).resolve())
 
     # 顶层模块：未指定则从网表推断
     if not top_module:
@@ -396,32 +580,85 @@ def run_yosys_lec(original_netlist, modified_netlist, run_dir, top_module=None,
     if not top_module:
         top_module = "top"
 
-    # 库文件：加载 .lib 避免标准单元被当黑盒（否则等价性检查失真）
+    # 库：**优先用 Verilog 功能模型**。
+    #
+    # 为什么不能只 read_liberty（2026-11-01，测试18 实测）：read_liberty 只给
+    # 黑盒定义（端口 + 时序），没有逻辑功能，门级 LEC 到 equiv_make 就报
+    #   ERROR: Missing function on output GCLK of cell sky130_fd_sc_hd__dlclkp_1
+    # 报告无效 = 规范 5.4.1-3 的「未完成」= 0 分。模型由 liberty_to_verilog()
+    # 从 .lib 的 function / next_state 生成，与库一一对应。
     lib_lines = []
-    lib_list = lib_files or []
-    if not lib_list:
-        lib_list = _infer_lib_files(original_netlist)
-    for lib in lib_list:
-        lib_lines.append(f"read_liberty {_quote_path(lib)}")
+    model_list = [m for m in (model_files or []) if m and Path(str(m)).exists()]
+    if model_list:
+        for mf in model_list:
+            # 必须 resolve：yosys 以 cwd=run_dir 运行，相对路径会找不到模型文件
+            lib_lines.append(f"read_verilog {_quote_path(Path(str(mf)).resolve())}")
+    else:
+        lib_list = lib_files or []
+        if not lib_list:
+            lib_list = _infer_lib_files(original_netlist)
+        for lib in lib_list:
+            lib_lines.append(f"read_liberty {_quote_path(lib)}")
 
     script_lines = [
         "# ============ 等价性检查（LEC）脚本 ============",
         "# 1. 读入原始（golden）网表 + 库",
         *lib_lines,
         f"read_verilog {original_netlist}",
-        f"hierarchy -top {top_module} -check",
+        # 不能用 `hierarchy -check`：它在裁剪未使用模块时先删、后查，会出现
+        #   "Module `sky130_fd_sc_hd__sdlclkp_1' referenced in module
+        #    `SNPS_CLOCK_GATE_HIGH_*' ... is not part of the design"
+        # 而该模块明明已由 lib_models 提供（2026-11-01 实测）。裸 `-top` 不裁剪，
+        # 缺模块会在 flatten 阶段暴露，效果一样但不误报。
+        f"hierarchy -top {top_module}",
+        # proc / memory 必须在 equiv_make 之前跑完：否则 yosys 直接拒绝
+        # 「Gold module contains memories or processes」而整个检查不成立。
+        # 门级网表通常只有 assign + 实例（proc 是空操作），但网表里一旦混进
+        # 行为级描述就必挂 —— 加上这两条是零成本的稳妥。
+        "proc",
+        "memory",
+        # flatten：把有定义的子模块（自定义 mux / 行为模型）内联成基本 cell，
+        # equiv_induct 的 SAT 才有模型可用。黑盒单元保持黑盒。
+        "flatten",
+        # flatten 会留下 $scopeinfo（作用域标记）cell，它们携带对**已被删除**的
+        # 子模块的引用；equiv_make 把这些 cell 复制进 equiv 模块后，equiv_induct
+        # 就报 "No SAT model available for cell r312.U2_gate (sky130_fd_sc_hd__inv_2)"。
+        # 清掉它们再继续（只是层次标记，不含逻辑）。
+        "delete t:$scopeinfo",
+        # 异步 FF（$dlatch / 带 clear 的 $dff）在 equiv_induct 里没有 SAT 模型：
+        #   ERROR: No SAT model available for async FF cell ... ($dlatch).
+        #   Consider running `async2sync` or `clk2fflogic` first.
+        # 两侧都做同样的变换，等价性判定不受影响。
+        "async2sync",
         f"design -stash gold",
         "",
         "# 2. 读入修改后网表",
+        # 库/模型**必须重读一遍**：上一步 flatten 会把已经内联掉的 sky130 模块
+        # 当作 unused 删掉（"Deleting now unused module sky130_..."），
+        # 再读第二份网表时这些 cell 就找不到定义、退化成黑盒，
+        # 于是 equiv_induct 报 "No SAT model available for cell r312.U56_gate"。
+        *lib_lines,
         f"read_verilog {modified_netlist}",
-        f"hierarchy -top {top_module} -check",
+        f"hierarchy -top {top_module}",
+        "proc",
+        "memory",
+        "flatten",
+        "delete t:$scopeinfo",
+        "async2sync",
         "design -stash gate",
         "",
         "# 3. 建立等价映射并证明",
-        "design -copy-from gold -as gold gold",
-        "design -copy-from gate -as gate gate",
+        # selection 必须是**真实模块名**（top_module），不是设计别名。
+        # 旧实写字面量 `gold`/`gate` → yosys 报 "Can't find gold module gold"，
+        # 整条 LEC 路径从未真正跑通（回滚到原网表，看起来像"证明不了"）。
+        f"design -copy-from gold -as gold {top_module}",
+        f"design -copy-from gate -as gate {top_module}",
         "equiv_make gold gate equiv",
-        "prep -flatten -top",
+        # 不能用 `prep -flatten -top`：`-top` 后面必须跟模块名，只写 `-top`
+        # 直接语法错（"Unknown option or option in arguments"），整条 LEC 作废。
+        # 标准等价流程也不需要 prep —— equity 模块里全是 $equiv cell，
+        # prep 的 flatten/opt 反而可能把它们优化掉。
+        "hierarchy -top equiv",
         "opt_clean",
         "equiv_simple",
         "equiv_induct",
@@ -430,8 +667,9 @@ def run_yosys_lec(original_netlist, modified_netlist, run_dir, top_module=None,
         "equiv_status -assert",
         "equiv_status",
         "stat",
-        "",
-        "exit",
+        # 不要写 `exit`：yosys 的脚本模式没有这个命令
+        # （`ERROR: No such command: exit`），报错会让整次检查的退出码非 0，
+        # 于是一个本来 PASS 的证明被判成失败。脚本读完自然退出。
     ]
     script = "\n".join(script_lines)
     script_path = run_dir / "lec.ys"
@@ -439,7 +677,10 @@ def run_yosys_lec(original_netlist, modified_netlist, run_dir, top_module=None,
 
     try:
         proc = subprocess.run(
-            [config.YOSYS, "-q", "-s", str(script_path)],
+            # 不要加 `-q`：静默模式下 equiv_status 的统计（N matched / unmatched）
+            # 完全不输出，报告是空的 —— 既拿不到"正向 PASS 证据"。也交不出
+            # 规范第 90 行要求的"功能等价检查报告"。
+            [config.YOSYS, "-s", str(script_path)],
             cwd=str(run_dir),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -537,6 +778,14 @@ def _parse_equiv_stats(stdout):
     m = re.search(r"(\d+)\s+unmatched", stdout)
     if m:
         unmatched = int(m.group(1))
+    # yosys 实际口径：`Of those cells N are proven and M are unproven.`
+    # （没有 "N matched" 这种写法，旧解析永远拿到 0/0，报告里等于没数字）
+    if not matched:
+        tail = re.findall(r"are\s+proven\s+and\s+(\d+)\s+are\s+unproven", stdout)
+        if tail:
+            matched = int(re.findall(r"Of those cells (\d+) are proven", stdout)[-1]) \
+                if re.findall(r"Of those cells (\d+) are proven", stdout) else 0
+            unmatched = int(tail[-1])
     return matched, unmatched
 
 
@@ -565,19 +814,36 @@ def _detect_equiv_pass(stdout, returncode):
     # 负向证据优先
     if re.search(r"Equivalence\s+check\s+failed", text, re.IGNORECASE):
         return False
-    if re.search(r"\bunproven\b", text, re.IGNORECASE):
-        return False
+    # 注意：不能裸匹配 `\bunproven\b` —— yosys 的中间日志会打印
+    #   "Found 1 unproven $equiv cells (1 groups)"（equiv_induct 之前的 before 状态），
+    # 后面可能已经证明掉了。旧的裸匹配让一个 PASS 的证明被判成失败，
+    # 于是 ECO 被回滚、LEC 报告作废。
+    # 真正的负向证据只有「最终统计里 unproven > 0」，见下面的 tail_stats。
 
     m = re.search(r"(\d+)\s+unmatched", text)
     if m and int(m.group(1)) > 0:
         return False
 
+    # 负向证据（**最终**统计）：yosys 的实际输出是
+    #   "Of those cells 1 are proven and 0 are unproven."
+    # 只看中间行 "Found 1 unproven $equiv cells" 会误判（那是 before 状态，
+    # 后面的 equiv_induct 可能已经证明掉了）。所以取最后一次统计。
+    tail_stats = re.findall(r"are\s+proven\s+and\s+(\d+)\s+are\s+unproven", text)
+    if tail_stats and int(tail_stats[-1]) > 0:
+        return False
+
     # 正向证据
     if re.search(r"equiv_status:\s*PASS", text, re.IGNORECASE):
         return True
+    if re.search(r"equivalence\s+successfully\s+proven", text, re.IGNORECASE):
+        return True
     if re.search(r"successfully\s+proved", text, re.IGNORECASE):
         return True
+    if re.search(r"No\s+selected\s+unproven\s+\$?equiv\s+cells", text, re.IGNORECASE):
+        return True
     if re.search(r"No\s+unproven\s+\$?equiv\s+cells", text, re.IGNORECASE):
+        return True
+    if tail_stats and int(tail_stats[-1]) == 0:
         return True
 
     matched = re.search(r"(\d+)\s+matched", text)

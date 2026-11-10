@@ -57,6 +57,89 @@ _MIN_CALL_S = 20.0
 # 给到 30000 足够任何本项目的任务；有天花板是为了避免病态输入把调用拖爆。
 _REASONING_RETRY_CAP = 30000
 
+# 流式调用的「进度守护」比例：用掉这次调用预算的 80% 还一个字正文都没收到，
+# 就主动收手。依据（2026-10-26 实测，deepseek-v4-pro-0813，prompt 5574 tokens）：
+#   · 同一 prompt，max_tokens=4000 -> 61.1s 全花在 reasoning，正文 0 字符
+#   · 同一 prompt，max_tokens=30000 -> 260.2s，reasoning 16451，正文 1437 字符
+# 也就是说「慢」是模型在思考，且我们无法从外部知道它要想多久。非流式只能
+# 干等到超时；流式至少能看见 reasoning 在涨、正文还没开始，从而提前放弃，
+# 把剩下的时间还给工具轮。
+_STREAM_GUARD_RATIO = 0.8
+
+# 思考开关是否被当前网关/模型拒绝过（进程内记住，避免每次都白撞一次 400）。
+_THINKING_UNSUPPORTED = False
+
+
+def _thinking_options(thinking=None):
+    """要随请求下发的「思考模式」参数。
+
+    依据百炼文档：deepseek-v4-pro-0813 等模型**默认开启思考**，通过
+    `enable_thinking: false` 关闭；`reasoning_effort` 只调强度（low/high/max）。
+    这类参数不是 OpenAI 标准字段，SDK 里必须走 extra_body。
+
+    Args:
+        thinking: True/False 按**本次调用**强制开/关；None 用全局配置
+            `config.LLM_ENABLE_THINKING`。
+
+    为什么要按调用区分（2026-10-28）：本系统的两类 LLM 调用对「想清楚」的
+    需求差得很远 ——
+      · **理解**（读任务书语义、判断哪段是描述哪段是配置要求）：需要推理，
+        开思考质量明显更稳，代价 ~60s；
+      · **计划**（在已知字段清单里做结构化决策）：是填空题不是解答题，
+        关思考 6~7s 就够，开思考纯属浪费。
+    全局开关只能一刀切，于是要么全慢要么全糙。
+    """
+    if _THINKING_UNSUPPORTED:
+        return {}
+    want = config.LLM_ENABLE_THINKING if thinking is None else bool(thinking)
+    opts = {}
+    if not want:
+        opts["enable_thinking"] = False
+    if config.LLM_REASONING_EFFORT:
+        opts["reasoning_effort"] = config.LLM_REASONING_EFFORT
+    return opts
+
+
+def _is_param_rejection(exc):
+    """判断异常是不是「不认识这个参数」（换取法重试）。"""
+    msg = str(exc).lower()
+    if not any(k in msg for k in ("enable_thinking", "reasoning_effort",
+                                  "unknown parameter", "unrecognized", "invalid parameter")):
+        return False
+    return any(k in msg for k in ("400", "invalid", "unknown", "unrecognized",
+                                  "unsupported", "bad request"))
+
+
+_TRACE_CAP = 20000
+
+
+def _trace_reasoning(reasoning, note=""):
+    """
+    把模型这次「想了什么」落到文件里（`SCAN_AGENT_LLM_TRACE=/path/to/log`）。
+
+    为什么要这么做：我们之前只能从日志看到「思考约 19179 字符」，
+    完全不知道它在想什么，于是只能猜「是不是 prompt 写坏了」。
+    落盘后可以直接读原文 —— 是反复自我纠错、还是在重算网表、还是在纠结规则语义，
+    一眼就能看出来，也才有依据继续压缩 prompt。
+    """
+    path = os.environ.get("SCAN_AGENT_LLM_TRACE")
+    if not path or not reasoning:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"\n===== {time.strftime('%H:%M:%S')} {note} "
+                     f"({len(reasoning)} 字符) =====\n")
+            fh.write(reasoning[:_TRACE_CAP])
+            if len(reasoning) > _TRACE_CAP:
+                fh.write(f"\n…（截断，原始 {len(reasoning)} 字符）\n")
+            fh.write("\n")
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
+class _StreamUnsupported(Exception):
+    """网关/SDK 不支持 stream 或 stream_options（例如自建兼容层）。"""
+
 
 class LLMClient:
     """基于 OpenAI 兼容协议的 LLM 客户端。"""
@@ -67,6 +150,12 @@ class LLMClient:
         self.calls = 0
         self.skipped = 0
         self.failures = 0
+        self.guarded = 0          # 流式守护提前收手的次数
+        self.partial = 0          # 返回「部分正文」的次数（被截断但有内容）
+        self.retries = 0          # 瞬时错误重试次数
+        self.fail_kinds = {}      # 失败按异常类型计数，便于事后归因
+        self.last_cost = 0.0      # 最近一次**成功**调用的耗时（用于判断「来不来得及」）
+        self.last_usage = {}      # 最近一次的 token 用量（诊断用）
         self.time_spent = 0.0
         # 截止时间（epoch 秒）；None 表示不限制。由调用方按「剩余预算」设置，
         # 保证任何一次 LLM 调用都不会把 case 的 wall time 预算吃光。
@@ -100,10 +189,22 @@ class LLMClient:
 
     def stats_line(self) -> str:
         """一行调用统计，用于写进容器日志。"""
+        extra = ""
+        if self.guarded:
+            extra += f" / 提前收手 {self.guarded} 次"
+        if self.partial:
+            extra += f" / 部分输出 {self.partial} 次"
+        if self.retries:
+            extra += f" / 重试 {self.retries} 次"
+        if self.fail_kinds:
+            kinds = ",".join(f"{k}×{v}" for k, v in
+                             sorted(self.fail_kinds.items(), key=lambda kv: -kv[1])[:3])
+            extra += f" / 失败类型 {kinds}"
         return (f"LLM 调用 {self.calls} 次 / 因超时跳过 {self.skipped} 次 / "
-                f"失败 {self.failures} 次 / 累计 {self.time_spent:.1f}s")
+                f"失败 {self.failures} 次{extra} / 累计 {self.time_spent:.1f}s")
 
-    def chat(self, system_prompt, user_prompt, temperature=None, max_tokens=None):
+    def chat(self, system_prompt, user_prompt, temperature=None, max_tokens=None,
+             thinking=None):
         """
         发起一次对话补全，返回文本内容。
 
@@ -118,6 +219,8 @@ class LLMClient:
             user_prompt: 用户提示词
             temperature: 温度（可选，覆盖默认）
             max_tokens: 最大 token 数（可选）
+            thinking: True/False 本次调用强制开/关思考；None 用全局配置。
+                见 `_thinking_options` 的说明 —— 理解类调用开、填空类调用关。
 
         Returns:
             str 或 None（失败/超时/时间不足时）
@@ -125,11 +228,15 @@ class LLMClient:
         if not self.available:
             return None
 
-        # 时间护栏：来不及返回就不要发
+        # 时间护栏：来不及返回就不要发。
+        # 阈值取「上次成功调用的实测耗时 ×1.05」与 _MIN_CALL_S 的较大值 ——
+        # 固定 20s 太乐观：计划调用实测 ~30s，剩余 25s 时发出去必然被流式守护砍掉。
         left = self.time_left()
-        if left is not None and left <= _MIN_CALL_S:
+        need = max(_MIN_CALL_S, self.last_cost * 1.05 if self.last_cost else 0.0)
+        if left is not None and left < need:
             self.skipped += 1
-            print(f"  [LLM] 剩余时间 {left:.1f}s 不足 {_MIN_CALL_S:.0f}s，"
+            hint = f"（上次实测 {self.last_cost:.0f}s）" if self.last_cost else ""
+            print(f"  [LLM] 剩余时间 {left:.1f}s 不足一次调用{hint}，"
                   f"跳过本次调用（改用确定性路径）", file=sys.stderr)
             return None
 
@@ -151,73 +258,284 @@ class LLMClient:
             temperature=temperature,
             timeout=req_timeout,
         )
+        _opts = _thinking_options(thinking)
+        if _opts:
+            req["extra_body"] = dict(_opts)
+        content, meta = "", {}
+        failure = None
         try:
-            try:
-                response = self.client.chat.completions.create(**req)
-            except TypeError as te:
-                # SDK 大版本差异兜底：新版把 max_tokens 改名为
-                # max_completion_tokens（旧名仍兼容一段时间，但不保证）。
-                # 平台实际装到的是 openai 3.37.0，而参考示例 pin 的是 1.12.0，
-                # 中间跨了大版本 —— 这里做一次参数名回退，避免整条 LLM 路径失效。
-                if "max_tokens" not in str(te):
-                    raise
-                req.pop("max_tokens", None)
-                req["max_completion_tokens"] = max_tokens
-                print("  [LLM] 该 SDK 不接受 max_tokens，改用 "
-                      "max_completion_tokens 重试一次", file=sys.stderr)
-                response = self.client.chat.completions.create(**req)
-        except Exception as e:                                  # noqa: BLE001
-            self.failures += 1
-            print(f"  [LLM] 调用失败（超时 {req_timeout:.0f}s）：{e}", file=sys.stderr)
-            return None
+            # 最多两次：第一次失败若属瞬时错误（连接重置 / 502 / 429 …）且剩余
+            # 时间还够，再试一次。以前是 0 重试 —— 一次瞬时抖动就丢掉整轮 LLM，
+            # 对 12 个 case 的评测 = 白丢一个 case 的 LLM 决策。
+            for attempt in (1, 2):
+                try:
+                    content, meta = self._dispatch(req, req_timeout)
+                    failure = None
+                    break
+                except Exception as e:                          # noqa: BLE001
+                    failure = e
+                    if not self._should_retry(e, attempt, t0):
+                        break
+                    self.retries += 1
+                    print(f"  [LLM] {type(e).__name__}（{str(e)[:60]}），"
+                          f"剩余时间够，重试一次", file=sys.stderr)
         finally:
             self.time_spent += time.time() - t0
 
-        self.calls += 1
-        choice = response.choices[0]
-        content = choice.message.content
+        if failure is not None:
+            self.failures += 1
+            kind = type(failure).__name__
+            self.fail_kinds[kind] = self.fail_kinds.get(kind, 0) + 1
+            print(f"  [LLM] 调用失败（超时 {req_timeout:.0f}s，{kind}）：{failure}",
+                  file=sys.stderr)
+            return None
 
-        # 调试开关（默认关闭，生产不打印）：用于诊断「调用成功但内容为空」。
-        # 推理型模型（如 deepseek 系列）会先消耗 token 做 reasoning，
-        # 若 max_tokens 给小了，reasoning 会把预算吃光、content 为空 ——
-        # finish_reason 会显示 length，usage 能看到 reasoning token 占比。
-        if os.environ.get("SCAN_AGENT_DEBUG_LLM") == "1":
-            u = getattr(response, "usage", None)
-            print(f"  [LLM-debug] finish_reason={getattr(choice, 'finish_reason', '?')} "
-                  f"usage={u} content_len={len(content or '')}", file=sys.stderr)
+        # 记下这次真实耗时与 token 用量：下一次调用前据此判断「来不来得及」，
+        # 出问题时也能从日志看出慢在 reasoning 还是 prompt。
+        self.last_cost = time.time() - t0
+        self.last_usage = meta.get("usage") or {}
 
-        # ---- 推理模型适配：reasoning 吃光 max_tokens -> 正文为空 ----
-        #
-        # deepseek-v4-pro 是推理模型：思考阶段的 token **也计入 max_tokens**。
-        # 当上限不足时返回 finish_reason=length 且 content 为空 ——
-        # 这**不是**「模型答不出」，而是「预算没给够」，直接向上层报空会白白
-        # 退化到确定性路径（实测任务二曾因此连续 2 个 case 全部空返回）。
-        # 因此这里自动放大上限重试一次（上限有天花板，不会无限翻倍）。
-        if (not (content or "").strip()
-                and getattr(choice, "finish_reason", "") == "length"):
-            bigger = min(int(max_tokens or 0) * 2, _REASONING_RETRY_CAP)
-            spent = time.time() - t0
-            left2 = self.time_left()
-            affordable = left2 is None or left2 > spent * 1.2 + _MIN_CALL_S
-            if bigger > int(max_tokens or 0) and affordable:
+        content = (content or "").strip()
+        if not content:
+            # 【已删除「同值重试」】旧实现在正文为空且 finish=length 时用
+            # max_tokens*2 再发一次，而 _REASONING_RETRY_CAP 恰好等于默认上限
+            # 30000 —— bigger == max_tokens，等于拿一模一样的参数又跑一遍，
+            # 白烧一倍时间（2026-10-26 实测单次 260s）。现在直接放弃，
+            # 把时间留给下一轮或工具。
+            if meta.get("finish") == "length":
                 print(f"  [LLM] reasoning 占满 {max_tokens} tokens（正文为空），"
-                      f"以 {bigger} 重试", file=sys.stderr)
-                return self.chat(system_prompt, user_prompt,
-                                 temperature=temperature, max_tokens=bigger)
-            print(f"  [LLM] reasoning 占满 {max_tokens} tokens 且时间不足，"
-                  f"放弃本次调用", file=sys.stderr)
+                      f"放弃本次调用", file=sys.stderr)
+            return None
 
+        self.calls += 1
+        if meta.get("partial"):
+            self.partial += 1
+            print(f"  [LLM] 时间到，采用已生成的部分输出（{len(content)} 字符）",
+                  file=sys.stderr)
+
+        if os.environ.get("SCAN_AGENT_DEBUG_LLM") == "1":
+            print(f"  [LLM-debug] finish={meta.get('finish')} "
+                  f"reasoning_chars={meta.get('reasoning_chars')} "
+                  f"content_len={len(content)} partial={meta.get('partial')} "
+                  f"cost={self.last_cost:.0f}s usage={self.last_usage}",
+                  file=sys.stderr)
         return content
 
-    def chat_json(self, system_prompt, user_prompt, max_tokens=None):
+    # ------------------------------------------------------------------
+    # 两种调用形态：流式（默认）与一次性（兜底）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _delta_text(delta):
+        """从流式 delta 里取出 (正文片段, reasoning 片段)。
+
+        不同网关字段名不一：DashScope/DeepSeek 用 reasoning_content，
+        有些兼容层塞在 model_extra 里，这里一并兜住。
+        """
+        if delta is None:
+            return "", ""
+        piece = getattr(delta, "content", None) or ""
+        reasoning = getattr(delta, "reasoning_content", None) or ""
+        if not reasoning:
+            extra = getattr(delta, "model_extra", None) or {}
+            reasoning = extra.get("reasoning_content") or ""
+        return piece, reasoning
+
+    def _call_streaming(self, req, req_timeout):
+        """流式调用：边收边看进度，注定跑不完就提前收手。
+
+        返回 (content, meta)。content 可能为空或为「部分正文」（被截断），
+        调用方据此决定是否走补齐逻辑。
+        """
+        t0 = time.time()
+        guard_at = t0 + req_timeout * _STREAM_GUARD_RATIO
+        hard_at = t0 + req_timeout * 0.98
+        parts, reasoning_chars, finish, partial = [], 0, None, False
+        usage = {}
+        trace_on = bool(os.environ.get("SCAN_AGENT_LLM_TRACE"))
+        reasoning_parts = []
+
+        try:
+            stream = self.client.chat.completions.create(
+                **req, stream=True, stream_options={"include_usage": True})
+        except Exception as exc:                                # noqa: BLE001
+            msg = str(exc).lower()
+            if any(k in msg for k in ("stream_options", "unsupported", "not support",
+                                      "invalid_request", "unknown parameter")):
+                raise _StreamUnsupported(str(exc))
+            raise
+
+        try:
+            chunk_iter = iter(stream)
+        except TypeError:
+            # 有的兼容层/自建网关无视 stream=True，直接返回完整响应对象。
+            # 这时不能当失败处理 —— 按非流式结果解析即可。
+            return self._parse_blocking_response(stream)
+
+        try:
+            for chunk in chunk_iter:
+                # 有的网关把 usage 放在最后一个 chunk（stream_options.include_usage）
+                u = getattr(chunk, "usage", None)
+                if u is not None:
+                    usage = {
+                        "prompt": getattr(u, "prompt_tokens", None),
+                        "completion": getattr(u, "completion_tokens", None),
+                        "reasoning": ((getattr(u, "completion_tokens_details", None)
+                                       and getattr(u.completion_tokens_details,
+                                                   "reasoning_tokens", None))),
+                    }
+                for ch in (getattr(chunk, "choices", None) or []):
+                    piece, rc = self._delta_text(getattr(ch, "delta", None))
+                    if rc:
+                        reasoning_chars += len(rc)
+                        if trace_on and reasoning_chars <= _TRACE_CAP * 2:
+                            reasoning_parts.append(rc)
+                    if piece:
+                        parts.append(piece)
+                    if getattr(ch, "finish_reason", None):
+                        finish = ch.finish_reason
+                now = time.time()
+                if now >= guard_at and not parts:
+                    # 一个字正文都没有：继续等只是把整段时间丢光
+                    self.guarded += 1
+                    print(f"  [LLM] 已用 {now - t0:.0f}s 仍无正文"
+                          f"（思考约 {reasoning_chars} 字符），提前收手", file=sys.stderr)
+                    break
+                if now >= hard_at:
+                    if parts:
+                        partial = True
+                        print(f"  [LLM] 到点截断，保留已收到的 {len(''.join(parts))} 字符",
+                              file=sys.stderr)
+                    break
+        finally:
+            close = getattr(stream, "close", None)
+            if close:                                            # 提前 break 时必须关
+                try:
+                    close()
+                except Exception:                                # noqa: BLE001
+                    pass
+
+        if reasoning_parts:
+            _trace_reasoning("".join(reasoning_parts), note="stream")
+
+        content = "".join(parts)
+        meta = {"finish": finish, "reasoning_chars": reasoning_chars,
+                "partial": partial or (bool(content) and finish is None),
+                "usage": usage}
+        return content, meta
+
+    @staticmethod
+    def _rename_max_tokens(req):
+        """SDK 大版本差异：新版把 max_tokens 改名 max_completion_tokens。"""
+        if "max_tokens" in req:
+            req["max_completion_tokens"] = req.pop("max_tokens")
+
+    def _dispatch(self, req, req_timeout):
+        """带上「思考开关被拒 → 去掉重试」的外壳。"""
+        global _THINKING_UNSUPPORTED
+        try:
+            return self._dispatch_once(req, req_timeout)
+        except Exception as e:                                  # noqa: BLE001
+            if req.get("extra_body") and _is_param_rejection(e):
+                _THINKING_UNSUPPORTED = True
+                req.pop("extra_body", None)
+                print("  [LLM] 该模型不接受 enable_thinking/reasoning_effort，"
+                      "去掉后重试（后续调用不再发送）", file=sys.stderr)
+                return self._dispatch_once(req, req_timeout)
+            raise
+
+    def _dispatch_once(self, req, req_timeout):
+        """
+        发一次请求：流式优先，网关不支持流式时退回一次性调用。
+
+        为什么单独抽出来（旧实现的坑）：`_StreamUnsupported` 与 `TypeError`
+        两个 except 分支是并列的 —— 如果「不支持流式 → 走一次性调用」这一步又
+        抛 TypeError，外层的 TypeError 分支会把请求**再次发给流式接口**，
+        于是又撞 _StreamUnsupported，最终落到最外层 except 判失败。
+        这里把顺序理清楚：流式（含改名重试）→ 失败则一次性（含改名重试）。
+        """
+        try:
+            try:
+                return self._call_streaming(req, req_timeout)
+            except TypeError as te:
+                if "max_tokens" not in str(te):
+                    raise
+                self._rename_max_tokens(req)
+                return self._call_streaming(req, req_timeout)
+        except _StreamUnsupported:
+            print("  [LLM] 网关不支持流式，退回一次性调用", file=sys.stderr)
+
+        try:
+            return self._call_blocking(req)
+        except TypeError as te:
+            if "max_tokens" not in str(te):
+                raise
+            self._rename_max_tokens(req)
+            return self._call_blocking(req)
+
+    def _should_retry(self, exc, attempt, t0):
+        """
+        是否值得重试一次。
+
+        只重试**瞬时性**错误：连接/超时/限流/5xx。
+        鉴权(401)、欠费(402/403)、参数(400) 重试没有意义，只会白烧时间 ——
+        这也是「是不是欠费」能在日志里一眼看出来的原因（失败类型会分类打印）。
+        """
+        if attempt >= 2:
+            return False
+        name = type(exc).__name__.lower()
+        msg = str(exc).lower()
+        transient = ("timeout" in name or "connection" in name or "ratelimit" in name
+                     or "internalserver" in name or "serviceunavailable" in name
+                     or any(k in msg for k in ("502", "503", "504", "connection reset",
+                                               "connection aborted", "temporarily",
+                                               "overloaded", "try again")))
+        if not transient:
+            return False
+        left = self.time_left()
+        if left is None:
+            return True
+        spent = time.time() - t0
+        # 重试必须留够「上一次实际耗时」的 1.2 倍，否则重试也会被守护砍掉
+        need = max(spent * 1.2, (self.last_cost * 1.2) if self.last_cost else 0.0, 30.0)
+        return left >= need
+
+    def _call_blocking(self, req):
+        """一次性调用（流式不被支持时兜底）。"""
+        return self._parse_blocking_response(
+            self.client.chat.completions.create(**req))
+
+    @staticmethod
+    def _parse_blocking_response(response):
+        """把一次性响应解析成 (content, meta)。"""
+        choice = response.choices[0]
+        content = choice.message.content or ""
+        reasoning = getattr(choice.message, "reasoning_content", None) or ""
+        _trace_reasoning(reasoning, note="blocking")
+        u = getattr(response, "usage", None)
+        return content, {
+            "finish": getattr(choice, "finish_reason", None),
+            "reasoning_chars": len(reasoning),
+            "partial": False,
+            "usage": {
+                "prompt": getattr(u, "prompt_tokens", None) if u else None,
+                "completion": getattr(u, "completion_tokens", None) if u else None,
+                "reasoning": ((getattr(u, "completion_tokens_details", None)
+                               and getattr(u.completion_tokens_details,
+                                           "reasoning_tokens", None)) if u else None),
+            },
+        }
+
+    def chat_json(self, system_prompt, user_prompt, max_tokens=None, thinking=None):
         """
         发起对话并解析为 JSON，失败返回 None。
 
         自动剥离 Markdown 代码块标记（```json ... ```）。
 
         max_tokens 用于收紧输出上限（纯 JSON 抽取不需要长篇输出，收紧可降低延迟）。
+        thinking 见 `chat` 的同名参数。
         """
-        content = self.chat(system_prompt, user_prompt, max_tokens=max_tokens)
+        content = self.chat(system_prompt, user_prompt, max_tokens=max_tokens,
+                            thinking=thinking)
         if content is None:
             return None
 

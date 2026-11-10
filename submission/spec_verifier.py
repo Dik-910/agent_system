@@ -337,6 +337,15 @@ def review_with_llm(task, understanding, dofile_text, log_text, report_text, llm
 3. 不得报告「可能」「建议」「优化空间」类的推测；不得凭空要求说明书未写的配置。
 4. 若无法判断或没有明确依据，返回空列表。
 5. 只返回 JSON，不要解释。
+6. **已满足的项绝对不要放进 issues**。输出的是"问题清单"，不是"核对表" ——
+   某项如果已经满足，就不要出现。违反项 evidence 必须**指出哪里不对**
+   （如「-max_length 写 2000，要求 1000」），禁止只罗列已配置的内容
+   （如「Dofile 中：set_scan_cfg -max_length 1000」——这是"已满足"，不是问题）。
+7. **「配置有没有写」只看 Dofile 本身**：Dofile 里已经有的声明一律视为已配置。
+   「日志中没有打印 / 未显示 / 未见确认信息」**不构成**配置缺失的证据 ——
+   工具本来就不会逐条回显 set_scan_signal。日志只用于核对数值类结果
+   （DRC 违例数、扫描链数、端口命名等）。
+8. 只在「Dofile 确实没写」或「日志/报告里的数值与说明书要求不符」时才报问题。
 
 输出格式：
 {
@@ -375,10 +384,10 @@ def review_with_llm(task, understanding, dofile_text, log_text, report_text, llm
     if not isinstance(issues, list):
         return []
 
-    return _filter_verifiable_issues(issues, spec)
+    return _filter_verifiable_issues(issues, spec, dofile_text)
 
 
-def _filter_verifiable_issues(issues, spec):
+def _filter_verifiable_issues(issues, spec, dofile_text=""):
     """
     幻觉过滤：只保留「能在 task_spec 中找到依据」的问题。
 
@@ -399,9 +408,75 @@ def _filter_verifiable_issues(issues, spec):
         generic = {"dofile", "set", "scan", "the", "and", "for", "not", "json"}
         ident_hit = bool((toks - generic) & spec_idents)
         num_hit = bool(nums & spec_nums)
-        if ident_hit or num_hit:
-            kept.append(it)
+        if not (ident_hit or num_hit):
+            continue
+        # DRC 豁免类问题的规则号必须真的对上（2026-10-29 task_2/case6 平台实测）：
+        # 任务书禁止的是「对 DFTR1/DFTR9 设豁免」，而证据那行只有
+        # `{DFTR-TIE1 DFTR-TIE0} Ignore`（工具口径的固有告警豁免，任务书并不禁止）。
+        # 旧过滤只看"标识符在 spec 里出现过"，于是把这条合法配置判成违规，
+        # 驱动第 3 轮改动，反而从 0 违例退化到 2 条 DFTR-TIE1。
+        # 「日志里没打印」不是配置缺失的证据（2026-11-01 测试20 task_2/case5 实测：
+        # Dofile 里 scan_mode / mbist_mode 的常量声明齐全，LLM 仍报「日志中未显示
+        # 这些端口存在或配置生效的确认信息」，直接把一轮成功的运行判成失败，
+        # 并让 14 条 issue 全部 resolved=false）。Dofile 里确实声明了 -> 丢弃。
+        if _ABSENCE_RE.search(blob):
+            declared = {m for m in toks
+                        if re.search(r"-port\s+%s\b" % re.escape(m), dofile_text or "")}
+            if declared:
+                continue
+        # 「日志里没看到失败/违例」= 检查通过，不是问题
+        if _NO_FAILURE_RE.search(blob):
+            continue
+        if "set_scan_drc_rule_handling" in blob.lower():
+            want = {r.upper() for r in re.findall(r"\bDFTR[\w-]*\d\b", str(it.get("requirement", "")), re.I)}
+            have = {r.upper() for r in re.findall(r"\bDFTR[\w-]*\d\b", str(it.get("evidence", "")), re.I)}
+            if want and have and not (want & have):
+                continue
+        # 「证据只是在复述现行配置」不算问题（2026-11-02 本地 t2/c5 实测）：
+        # LLM 会把逐项核对表**整张**塞进 issues —— 四条 evidence 全是
+        # 「Dofile 中：set_scan_signal -type constant ...」这种"已经配好了"的复述，
+        # 甚至有一条自己写着「扫描链满足：最大链长 1000」。这类必须丢掉，
+        # 否则一次全对运行被判 ✗，14 条 issue 全 resolved=false。
+        # 只看 evidence：issue 字段常是 LLM 的套话（"…不符"），会把负面词带进来
+        if _restates_current_config(str(it.get("evidence", ""))):
+            continue
+        kept.append(it)
     return kept
+
+
+# 「没有发现问题」的正面表述：`日志中未显示其他 DRC 违例清零失败信息` 这类
+# 是否定之否定，语义是"检查通过"，不能当问题证据。
+_NO_FAILURE_RE = re.compile(
+    r"(?:未|没有|并未)\s*(?:显示|出现|发现|见|观察到)[^。；\n]{0,24}"
+    r"(?:失败|违例|错误|问题|异常)")
+
+# 负面词：出现任意一个才说明"真的指控某处不对"。
+_NEG_CLAIM_RE = re.compile(
+    r"缺失|缺少|未声明|未配置|未设置|未找到|未包含|不符|不符合|不一致|错误|冲突|"
+    r"多余|冗余|违反|不满足|偏离|超过|低于")
+
+
+def _restates_current_config(blob):
+    """
+    这条 issue 是不是只在复述"现状"，而没有真的指控哪里不对。
+
+    判据（两条同时成立）：
+      ① 证据里出现 `Dofile 中：` / `Dofile 里：` 这类"引用现行配置"的写法；
+      ② 全段找不到任何负面词（缺失/不符/违反/多余 …）。
+    满足即为"核对表里已通过的那一项"，不是问题。
+    """
+    text = str(blob or "")
+    if not re.search(r"Dofile\s*(?:中|里)\s*[：:]", text):
+        return False
+    if _NEG_CLAIM_RE.search(text):
+        return False
+    return True
+
+
+# 「日志里没有显示/打印/确认」这类说辞：工具不会逐条回显配置，不能当证据
+_ABSENCE_RE = re.compile(
+    r"日志(?:中|里)?\s*(?:未|没有|并未)\s*(?:显示|打印|出现|确认|见|观察到|提及)"
+    r"|(?:未|没有)\s*在日志(?:中|里)?\s*(?:显示|打印|出现|确认|见)")
 
 
 # ---------------------------------------------------------------------------

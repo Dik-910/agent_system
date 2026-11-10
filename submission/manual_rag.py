@@ -68,7 +68,7 @@ TOP_K = int(os.environ.get("RAG_TOP_K", "3"))
 CHUNK_MAX_CHARS = int(os.environ.get("RAG_CHUNK_SIZE", "2000"))
 
 # 单个片段返回给 LLM 时的最大字符数（防止 prompt 被撑爆）
-SNIPPET_MAX_CHARS = int(os.environ.get("RAG_SNIPPET_CHARS", "1000"))
+SNIPPET_MAX_CHARS = int(os.environ.get("RAG_SNIPPET_CHARS", "2000"))
 
 # 索引结构版本；不兼容升级时递增，旧缓存自动失效
 # v3：新增 manual/**/*.md（工具自带的 additional_cmds 命令文档，如 add_inst/connect_net）
@@ -436,6 +436,31 @@ def _extract_keywords(text, title=""):
     return kws
 
 
+def _trim_around_keywords(body, kws, limit):
+    """
+    超长正文截断时，以**关键词首次出现的位置为中心**取窗口，而不是从头截。
+
+    为什么必须这样做（2026-11-02 核对手册覆盖时发现）：`remove_scan_chain`
+    在 2.1.2.4 章的检索分是 10.09（命中很准），但整章合并后 1930 字，
+    从头截到 2000 字正好把命令原文切掉 —— 检索"命中了"，模型却看不到那条命令。
+    命令名往往出现在章节中后部，从头截等于白检索。
+    """
+    if not body or len(body) <= limit:
+        return body
+    pos = -1
+    low = body.lower()
+    for kw in (kws or ()):
+        i = low.find(str(kw).lower())
+        if i >= 0 and (pos < 0 or i < pos):
+            pos = i
+    if pos < 0:
+        return body[:limit] + " …（截断）"
+    start = max(0, min(pos - limit // 3, len(body) - limit))
+    head = "…" if start > 0 else ""
+    tail = "…（截断）" if start + limit < len(body) else ""
+    return head + body[start:start + limit] + tail
+
+
 def _query_keywords(query):
     """从查询文本提取关键词（与索引侧保持同一套规则）。"""
     kws = set()
@@ -698,25 +723,44 @@ class ManualRAG:
                     scores[c["id"]] = scores.get(c["id"], 0.0) + bonus
 
         ranked = sorted(scores.items(), key=lambda x: -x[1])
-        hits = []
-        taken_sections = set()
+
+        # 同源同节的多段**合并成一条**，而不是只取其中一段。
+        #
+        # 旧实现是「同节只取一段」（`taken_sections` 去重），目的是把 top_k 名额
+        # 留给不同命令；但代价太大：84 个章节里有 41 个被切成多段，只取一段
+        # 等于**丢掉该章一半正文**。实测 `set_scan_cell_mapping` 就在 2.1.2.9 的
+        # 第 2 段里 —— 检索能定位到 2.1.2.9，返回的却是第 1 段，命令原文根本到不了
+        # 模型手里（2026-11-02 核对手册覆盖时发现）。
+        # 现在按 sibling_rank 拼接整章，名额仍然只占一个。
+        grouped, order = {}, []
         for cid, score in ranked:
             c = chunks[cid]
-            # 同源同节只取一段（见 _assign_sibling_ranks 的说明）
-            sec_key = (c.get("source"), c.get("section"), c.get("title"))
-            if sec_key in taken_sections:
-                continue
-            taken_sections.add(sec_key)
+            key = (c.get("source"), c.get("section"), c.get("title"))
+            if key not in grouped:
+                grouped[key] = {"score": score, "parts": [], "head_chunk": c}
+                order.append(key)
+            g = grouped[key]
+            g["score"] = max(g["score"], score)
+            g["parts"].append(c)
+
+        hits = []
+        for key in order:
+            g = grouped[key]
+            parts = sorted(g["parts"],
+                           key=lambda c: (c.get("sibling_rank") is None,
+                                          c.get("sibling_rank") or 0))
+            text = "\n".join(p.get("text", "") for p in parts)
+            c = g["head_chunk"]
             head = f"{c.get('section', '')} {c.get('title', '')}".strip()
             hits.append({
-                "id": cid,
-                "score": round(score, 3),
+                "id": c["id"],
+                "score": round(g["score"], 3),
                 "section": c.get("section", ""),
                 "title": c.get("title", ""),
                 "page": c.get("page"),
                 "source": c.get("source"),
                 "head": head,
-                "text": c.get("text", ""),
+                "text": text,
             })
             if len(hits) >= top_k:
                 break
@@ -737,11 +781,10 @@ class ManualRAG:
         if not hits:
             return ""
 
+        kws = _query_keywords(query) or set()
         parts = []
         for h in hits:
-            body = h["text"]
-            if len(body) > SNIPPET_MAX_CHARS:
-                body = body[:SNIPPET_MAX_CHARS] + " …（截断）"
+            body = _trim_around_keywords(h["text"], kws, SNIPPET_MAX_CHARS)
             loc = h["head"] or "手册"
             parts.append(f"【手册 · {loc}（p{h['page']}）】\n{body}")
         return "\n\n---\n\n".join(parts)
