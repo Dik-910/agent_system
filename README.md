@@ -1,6 +1,6 @@
 # agent_system
 
-基于大语言模型的 EDA Scan Insertion 智能体，用于 2026 年中国研究生集成电路创新大赛 · EDA 精英挑战赛赛题二。
+基于大语言模型的 EDA Scan Insertion 智能体，用于 2026 年中国研究生创"芯"大赛 · EDA 精英挑战赛赛题二。
 
 读取任务说明书与门级网表，自主生成、运行并修复 `dftexp_scan` 的 TCL dofile，完成从「插链配置」到「DRC 收敛 + 产物交付」的全流程。
 
