@@ -1,1 +1,17 @@
 /code.zip
+
+# Python 字节码缓存
+__pycache__/
+*.py[cod]
+
+# 本地凭据（镜像内一律由环境变量注入，见 submission/config.py）
+.env
+.env.*
+!.env.example
+
+# 本地运行产物
+out/
+*.log
+
+# 本地工作区数据
+.workbuddy/
